@@ -1,0 +1,5 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+html { font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+.shadow-card { @apply shadow-card rounded-card bg-white; }
