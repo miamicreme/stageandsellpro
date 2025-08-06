@@ -1,0 +1,10 @@
+{
+  "name": "Stage & Sell Pro",
+  "short_name": "SSP",
+  "icons": [
+    { "src": "/android-chrome-512x512.png", "sizes": "512x512", "type": "image/png" }
+  ],
+  "theme_color": "#2563EB",
+  "background_color": "#111827",
+  "display": "standalone"
+}
