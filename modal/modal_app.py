@@ -52,33 +52,38 @@ def _upload_asset(sb: Client, key: str, pil_img: Image.Image):
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=92)
     buf.seek(0)
-    sb.storage.from_("assets").upload(key, buf.getvalue(), {"content-type": "image/jpeg", "upsert": "true"})
+    # NOTE: use file_options with camelCase keys
+    sb.storage.from_("assets").upload(
+        key,
+        buf.getvalue(),
+        file_options={"contentType": "image/jpeg", "upsert": "true", "cacheControl": "31536000"}
+    )
 
 @stub.function(image=image, timeout=900, secrets=[modal.Secret.from_name("supabase-creds")])
 def process_job(job: Dict[str, Any]):
     sb = _sb()
     job_id = job["id"]
     files = job.get("files") or []
+    if not files:
+        sb.table("jobs").update({"status": "error", "assets": {"reason": "no_files"}}).eq("id", job_id).execute()
+        return "no-files"
     tmp = Path(tempfile.mkdtemp())
     assets_map = {}
     try:
-        # Download sources
         local_paths = _download_uploads(sb, files, tmp)
-        # Process each image (stub enhancement)
         for i, src_path in enumerate(local_paths, 1):
             staged = _simple_stage(src_path)
             key = f"{job_id}/staged_{i:02d}.jpg"
             _upload_asset(sb, key, staged)
             assets_map[f"staged_{i:02d}"] = _public_url(key)
 
-        # Demo flyer placeholder: just reuse first staged as cover
         if assets_map:
-            assets_map["flyer_cover"] = list(assets_map.values())[0]
+            assets_map.setdefault("flyer_cover", next(iter(assets_map.values())))
 
-        # Update DB
         sb.table("jobs").update({"status": "delivered", "assets": assets_map}).eq("id", job_id).execute()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
 
 @stub.function(
     image=image,
