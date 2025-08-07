@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 import os
 from pathlib import Path
 import tempfile, shutil, io
@@ -143,3 +144,7 @@ def poll_and_process() -> str:
 def run_local_test():
     job = {"id": "test-job", "files": []}
     print(process_job.fn(job))
+=======
+# (content abbreviated) 
+# placeholder - you should paste actual content from user's script above. 
+>>>>>>> Stashed changes
