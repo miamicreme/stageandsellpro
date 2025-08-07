@@ -1,5 +1,4 @@
 name: Modal Deploy
-
 on:
   workflow_dispatch:
   push:
@@ -22,10 +21,10 @@ jobs:
       - name: Install Modal CLI + deps
         run: |
           python -m pip install --upgrade pip
-          # Use the current package name; pins reduce surprises
+          # Install the CLI-capable package
           python -m pip install "modal>=0.56" Pillow==10.3.0 moviepy==1.0.3 supabase==2.4.3
-          # quick sanity check
-          python -c "import modal, sys; print('modal version:', modal.__version__)"
+          # Sanity checks
+          python -c "import modal; print('modal version:', getattr(modal,'__version__','?'))"
           python -m modal --help > /dev/null
 
       - name: Deploy to Modal
@@ -33,5 +32,4 @@ jobs:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         run: |
-          # Use module form so we don't depend on PATH
           python -m modal deploy modal/modal_app.py
