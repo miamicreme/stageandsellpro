@@ -19,7 +19,7 @@ image = (
 )
 
 # Optional cache volume (useful later when you add models)
-CACHE = modal.SharedVolume().persist("ssp-cache")
+# CACHE = modal.SharedVolume().persist("ssp-cache")
 
 # Safety knobs
 MAX_EDGE = 2048            # downscale long edge to avoid huge files / OOM
