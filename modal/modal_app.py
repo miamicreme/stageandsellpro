@@ -1,50 +1,52 @@
-<<<<<<< Updated upstream
-import os
+import os, io, shutil, tempfile
 from pathlib import Path
-import tempfile, shutil, io
 from typing import Dict, Any, List, Optional
 
 import modal
 from supabase import create_client, Client
-from PIL import Image, ImageEnhance, ImageFilter, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App: Stage & Sell Pro automated pipeline
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────── Modal App & Image ───────────────────────────────
 app = modal.App("stage-sell-pro-pipeline")
 
 image = (
-    modal.Image.debian_slim()
-    .apt_install("ffmpeg")
-    .pip_install("Pillow==10.3.0", "moviepy==1.0.3", "supabase==2.4.3")
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "ffmpeg")
+    .pip_install(
+        # GPU + Diffusers
+        "torch==2.2.2", "torchvision==0.17.2", "torchaudio==2.2.2", "xformers==0.0.25",
+        "diffusers==0.28.0", "transformers==4.41.0", "accelerate==0.28.0", "controlnet-aux==0.0.8",
+        # Utils
+        "Pillow==10.3.0", "moviepy==1.0.3", "supabase==2.4.3", "reportlab==4.1.0"
+    )
 )
 
-# Safety knobs
-MAX_EDGE = 2048            # downscale long edge to avoid huge files / OOM
+# Cache models between runs so the first cold start is the only download
+HF_CACHE = modal.NetworkFileSystem.persisted("ssp-hf-cache")
+
+# Tunables
+MAX_EDGE = 2048          # downscale long edge to keep memory/latency sane
 JPEG_QUALITY = 92
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────── Supabase helpers ──────────────────────────────
 def _sb() -> Client:
-    url = os.environ["SUPABASE_URL"]
-    key = os.environ["SUPABASE_KEY"]  # service role in Modal secret
-    return create_client(url, key)
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
 def _public_url(path: str) -> str:
-    return f"{os.environ['SUPABASE_URL'].rstrip('/')}/storage/v1/object/public/assets/{path}"
+    base = os.environ["SUPABASE_URL"].rstrip("/")
+    return f"{base}/storage/v1/object/public/assets/{path}"
 
-def _download_uploads(sb: Client, files: List[str], tmpdir: Path) -> List[Path]:
-    out: List[Path] = []
-    for rel in files:
-        data = sb.storage.from_("uploads").download(rel)              # supabase-py v2 bytes
-        dst = tmpdir / Path(rel).name
-        with open(dst, "wb") as f:
-            f.write(data)
-        out.append(dst)
-    return out
+def _upload(sb: Client, key: str, data: bytes, mime: str):
+    sb.storage.from_("assets").upload(
+        key, file=data,
+        file_options={"contentType": mime, "upsert": "true", "cacheControl": "31536000"}
+    )
 
-def _open_and_downscale(p: Path) -> Optional[Image.Image]:
+def _download_to(sb: Client, src_key: str, dst: Path):
+    dst.write_bytes(sb.storage.from_("uploads").download(src_key))
+
+# ───────────────────────────── Image helpers ─────────────────────────────────
+def _open_downscale(p: Path) -> Optional[Image.Image]:
     try:
         img = Image.open(p).convert("RGB")
     except (UnidentifiedImageError, OSError):
@@ -52,86 +54,166 @@ def _open_and_downscale(p: Path) -> Optional[Image.Image]:
     w, h = img.size
     m = max(w, h)
     if m > MAX_EDGE:
-        scale = MAX_EDGE / float(m)
-        img = img.resize(
-            (int(w * scale), int(h * scale)),   # ★ fixed parentheses
-            Image.LANCZOS
+        s = MAX_EDGE / float(m)
+        img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
+    return img
+
+# ───────────────────── SDXL + ControlNet lazy loader ────────────────────────
+from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+import torch
+
+_PIPE = None
+def get_pipe(style: str = "modern"):
+    """Load & memoize SDXL + depth-ControlNet (fp16, CUDA)."""
+    global _PIPE
+    if _PIPE is None:
+        controlnet = ControlNetModel.from_pretrained(
+            "diffusers/controlnet-depth-sdxl-1.0",
+            torch_dtype=torch.float16,
+            cache_dir="/root/.cache/huggingface",
         )
-    return img
+        _PIPE = StableDiffusionXLControlNetPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            controlnet=controlnet,
+            torch_dtype=torch.float16,
+            cache_dir="/root/.cache/huggingface",
+        ).to("cuda")
+        _PIPE.enable_xformers_memory_efficient_attention()
 
-def _simple_stage(img: Image.Image) -> Image.Image:
-    # Placeholder: minimal enhancement
-    img = ImageEnhance.Brightness(img).enhance(1.05)
-    img = ImageEnhance.Color(img).enhance(1.08)
-    img = img.filter(ImageFilter.SHARPEN)
-    return img
+    style_map = {
+        "modern": "modern Scandinavian furniture, light wood, airy, neutral palette",
+        "industrial": "industrial loft, exposed brick, metal accents, leather",
+        "contemporary": "contemporary minimalism, clean lines, designer furniture",
+    }
+    _PIPE.default_prompts = {
+        "positive": f"photo-realistic interior, {style_map.get(style, 'modern')}, ultra high detail, 8k",
+        "negative": "blurry, distorted, watermark, text, duplicate, low-quality",
+    }
+    return _PIPE
 
-def _upload_asset(sb: Client, key: str, pil_img: Image.Image):
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=JPEG_QUALITY)
-    buf.seek(0)
-    sb.storage.from_("assets").upload(
-        key,
-        file=buf.getvalue(),
-        file_options={"contentType": "image/jpeg", "upsert": "true", "cacheControl": "31536000"}
+def _ai_stage(img: Image.Image, style: str) -> Image.Image:
+    pipe = get_pipe(style)
+    out = pipe(
+        prompt=pipe.default_prompts["positive"],
+        negative_prompt=pipe.default_prompts["negative"],
+        image=img,                    # img2img keeps geometry
+        strength=0.45,
+        guidance_scale=7.0,
+        num_inference_steps=28,
     )
+    return out.images[0]
 
-def _already_delivered(job: Dict[str, Any]) -> bool:
-    return any(k.startswith("staged_") for k in (job.get("assets") or {}).keys())
+# ───────────────── Flyer (PDF) & Teaser (MP4) builders ──────────────────────
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
+from moviepy.editor import ImageClip, concatenate_videoclips
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Functions
-# ──────────────────────────────────────────────────────────────────────────────
-@app.function(image=image, timeout=900, secrets=[modal.Secret.from_name("supabase-creds")])
+def _build_flyer(cover_path: Path) -> Path:
+    pdf = cover_path.parent / "flyer.pdf"
+    c = canvas.Canvas(str(pdf), pagesize=letter)
+    W, H = letter
+    cover = Image.open(cover_path)
+    aspect = cover.width / cover.height
+    new_h = W / aspect
+    c.drawImage(ImageReader(cover), 0, H - new_h, width=W, height=new_h)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(40, H - new_h - 40, "Stage & Sell Pro — Virtual Staging")
+    c.setFont("Helvetica", 12)
+    c.drawString(40, H - new_h - 60, "Generated by AI • 48-hour turnaround")
+    c.showPage(); c.save()
+    return pdf
+
+def _build_teaser(staged_paths: List[Path]) -> Path:
+    out = staged_paths[0].parent / "teaser.mp4"
+    clips = [ImageClip(str(p)).set_duration(2.5) for p in staged_paths]
+    video = concatenate_videoclips(clips, method="compose")
+    video.write_videofile(str(out), fps=24, codec="libx264", audio=False, preset="ultrafast", logger=None)
+    return out
+
+def _already(job: Dict[str, Any]) -> bool:
+    return any(k.startswith("staged_") for k in (job.get("assets") or {}))
+
+# ───────────────────────────── Worker functions ──────────────────────────────
+@app.function(
+    image=image,
+    gpu="A10G",
+    timeout=900,
+    mounts={"/root/.cache/huggingface": HF_CACHE},
+    secrets=[modal.Secret.from_name("supabase-creds")],
+)
 def process_job(job: Dict[str, Any]) -> str:
-    sb = _sb()
-    job_id = job["id"]
+    sb, job_id = _sb(), job["id"]
+    if _already(job):
+        return f"skip {job_id} (already delivered)"
+
     files = job.get("files") or []
-
-    if _already_delivered(job):
-        return f"skip (already delivered) {job_id}"
-
     if not files:
         sb.table("jobs").update({"status": "error", "assets": {"reason": "no_files"}}).eq("id", job_id).execute()
         return "no-files"
 
     tmp = Path(tempfile.mkdtemp())
-    created: Dict[str, str] = {}
     try:
-        srcs = _download_uploads(sb, files, tmp)
-        idx = 0
-        for src in srcs:
-            img = _open_and_downscale(src)
+        style = job.get("style", "modern")
+        staged_paths: List[Path] = []
+        assets: Dict[str, str] = {}
+
+        # Process each uploaded source
+        for i, rel in enumerate(files, 1):
+            local = tmp / Path(rel).name
+            _download_to(sb, rel, local)
+            img = _open_downscale(local)
             if img is None:
                 continue
-            try:
-                staged = _simple_stage(img)
-                idx += 1
-                key = f"{job_id}/staged_{idx:02d}.jpg"
-                _upload_asset(sb, key, staged)
-                created[f"staged_{idx:02d}"] = _public_url(key)
-            except Exception as e:
-                print(f"[warn] failed staging {src.name}: {e}")
 
-        if not created:
+            # BEFORE: upload original as JPEG
+            bbuf = io.BytesIO(); img.save(bbuf, "JPEG", quality=JPEG_QUALITY); bbuf.seek(0)
+            before_key = f"{job_id}/before_{i:02d}.jpg"
+            _upload(sb, before_key, bbuf.getvalue(), "image/jpeg")
+            assets[f"before_{i:02d}"] = _public_url(before_key)
+
+            # AFTER: AI staging
+            staged = _ai_stage(img, style)
+            abuf = io.BytesIO(); staged.save(abuf, "JPEG", quality=JPEG_QUALITY); abuf.seek(0)
+            after_key = f"{job_id}/staged_{i:02d}.jpg"
+            _upload(sb, after_key, abuf.getvalue(), "image/jpeg")
+            assets[f"staged_{i:02d}"] = _public_url(after_key)
+
+            # Save local copy for video/flyer
+            out_local = tmp / f"staged_{i:02d}.jpg"
+            staged.save(out_local, "JPEG", quality=JPEG_QUALITY)
+            staged_paths.append(out_local)
+
+        if not staged_paths:
             sb.table("jobs").update({"status": "error", "assets": {"reason": "no_valid_images"}}).eq("id", job_id).execute()
             return "no-valid-images"
 
-        created.setdefault("flyer_cover", next(iter(created.values())))
-        sb.table("jobs").update({"status": "delivered", "assets": created}).eq("id", job_id).execute()
-        return f"delivered {job_id} ({len([k for k in created if k.startswith('staged_')])} images)"
+        # Flyer + teaser
+        flyer = _build_flyer(staged_paths[0])
+        _upload(sb, f"{job_id}/flyer.pdf", flyer.read_bytes(), "application/pdf")
+        assets["flyer"] = _public_url(f"{job_id}/flyer.pdf")
+
+        teaser = _build_teaser(staged_paths)
+        _upload(sb, f"{job_id}/teaser.mp4", teaser.read_bytes(), "video/mp4")
+        assets["teaser"] = _public_url(f"{job_id}/teaser.mp4")
+
+        assets.setdefault("flyer_cover", assets.get("staged_01", next(iter(assets.values()))))
+
+        # Finish
+        sb.table("jobs").update({"status": "delivered", "assets": assets}).eq("id", job_id).execute()
+        return f"delivered {job_id}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 @app.function(
     image=image,
-    schedule=modal.Period(seconds=120),         # every 2 minutes
-    secrets=[modal.Secret.from_name("supabase-creds")]
+    schedule=modal.Period(seconds=120),  # every 2 minutes
+    secrets=[modal.Secret.from_name("supabase-creds")],
 )
 def poll_and_process() -> str:
     sb = _sb()
-    resp = sb.table("jobs").select("*").eq("status", "queued").order("created_at", desc=False).limit(1).execute()
-    rows = resp.data or []
+    res = sb.table("jobs").select("*").eq("status", "queued").order("created_at", desc=False).limit(1).execute()
+    rows = res.data or []
     if not rows:
         return "no-queued-jobs"
     job = rows[0]
@@ -139,12 +221,6 @@ def poll_and_process() -> str:
     process_job.spawn(job)
     return f"spawned {job['id']}"
 
-# Local test (optional)
 @app.local_entrypoint()
 def run_local_test():
-    job = {"id": "test-job", "files": []}
-    print(process_job.fn(job))
-=======
-# (content abbreviated) 
-# placeholder - you should paste actual content from user's script above. 
->>>>>>> Stashed changes
+    print("Local test entry (no files) — structure OK")
