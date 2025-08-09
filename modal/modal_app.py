@@ -248,4 +248,103 @@ def process_job(job: Dict[str, Any]) -> str:
     tmp = Path(tempfile.mkdtemp(prefix=f"ssp_{job_id}_"))
     print(json.dumps({"event": "start", "job_id": job_id, "files": job.get("files", [])}))
     try:
-        style = job.get("style", "m
+        style = job.get("style", "modern")
+        staged_paths: List[Path] = []
+        assets: Dict[str, str] = {}
+
+        files = job.get("files") or []
+        for i, rel in enumerate(files, 1):
+            local = tmp / Path(str(rel)).name
+            try:
+                _download_to(sb, rel, local)
+                img = _open_downscale(local)
+                if img is None:
+                    print(json.dumps({"event": "bad_image", "src": rel}))
+                    continue
+            except Exception as e:
+                print(json.dumps({"event": "download_error", "src": rel, "error": str(e)}))
+                continue
+
+            # BEFORE
+            bbuf = io.BytesIO()
+            img.save(bbuf, "JPEG", quality=JPEG_QUALITY)
+            bbuf.seek(0)
+            before_key = f"{job_id}/before_{i:02d}.jpg"
+            _upload(sb, before_key, bbuf.getvalue(), "image/jpeg")
+            assets[f"before_{i:02d}"] = _public_url(before_key)
+
+            # AFTER (AI staging)
+            try:
+                staged = _ai_stage(img, style)
+            except Exception as e:
+                print(json.dumps({"event": "ai_stage_error", "index": i, "error": str(e)}))
+                continue
+
+            abuf = io.BytesIO()
+            staged.save(abuf, "JPEG", quality=JPEG_QUALITY)
+            abuf.seek(0)
+            after_key = f"{job_id}/staged_{i:02d}.jpg"
+            _upload(sb, after_key, abuf.getvalue(), "image/jpeg")
+            assets[f"staged_{i:02d}"] = _public_url(after_key)
+
+            out_local = tmp / f"staged_{i:02d}.jpg"
+            staged.save(out_local, "JPEG", quality=JPEG_QUALITY)
+            staged_paths.append(out_local)
+
+        if not staged_paths:
+            sb.table("jobs").update({"status": "error", "assets": {"reason": "no_valid_images"}}).eq("id", job_id).execute()
+            print(json.dumps({"event": "end_error", "job_id": job_id, "reason": "no_valid_images"}))
+            return "no-valid-images"
+
+        # Flyer + teaser
+        flyer = _build_flyer(staged_paths[0])
+        _upload(sb, f"{job_id}/flyer.pdf", flyer.read_bytes(), "application/pdf")
+        assets["flyer"] = _public_url(f"{job_id}/flyer.pdf")
+
+        teaser = _build_teaser(staged_paths)
+        _upload(sb, f"{job_id}/teaser.mp4", teaser.read_bytes(), "video/mp4")
+        assets["teaser"] = _public_url(f"{job_id}/teaser.mp4")
+
+        assets.setdefault("flyer_cover", assets.get("staged_01", next(iter(assets.values()))))
+
+        # Finish
+        sb.table("jobs").update({"status": "delivered", "assets": assets}).eq("id", job_id).execute()
+        print(json.dumps({"event": "end_ok", "job_id": job_id, "assets": list(assets.keys())}))
+        return f"delivered {job_id}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+@app.function(
+    image=image,
+    schedule=modal.Period(seconds=POLL_PERIOD_SECONDS),  # every N seconds
+    secrets=[modal.Secret.from_name("supabase-creds")],
+    cpu=1.0,
+    memory=1024,
+)
+def poll_and_process() -> str:
+    """Claim one queued job safely and spawn a GPU worker."""
+    sb = _sb()
+
+    # Get oldest queued job id
+    res = sb.table("jobs").select("id").eq("status", "queued").order("created_at", desc=False).limit(1).execute()
+    rows = res.data or []
+    if not rows:
+        return "no-queued-jobs"
+
+    job_id = rows[0]["id"]
+
+    # Try to atomically claim it by updating only if still queued
+    upd = sb.table("jobs").update({"status": "processing"}).eq("id", job_id).eq("status", "queued").execute()
+    # Some Supabase clients return data only if select() is used; we just re-check:
+    claimed = sb.table("jobs").select("status").eq("id", job_id).limit(1).execute().data[0]["status"] == "processing"
+    if not claimed:
+        return f"race-lost {job_id}"
+
+    # Fetch the full job payload
+    job = sb.table("jobs").select("*").eq("id", job_id).single().execute().data
+    process_job.spawn(job)  # fire-and-forget on GPU runner
+    return f"spawned {job_id}"
+
+@app.local_entrypoint()
+def run_local_test():
+    print("Local test entry — OK. Set GPU_TYPE=cpu to test CPU path.")
