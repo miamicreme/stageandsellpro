@@ -36,7 +36,6 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Optional: detect dep files for pip cache
       - name: Determine dependency files
         id: deps
         run: |
@@ -57,19 +56,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Install your project deps if present (optional)
           if ls requirements*.txt >/dev/null 2>&1; then
             pip install -r requirements.txt || true
           elif [ -f pyproject.toml ]; then
             python -m pip install build || true
-            # If you use poetry/pdm, add it here (optional)
           fi
-          # Modal CLI + libs your code expects
           pip install "modal>=0.56" Pillow==10.3.0 moviepy==1.0.3 supabase==2.4.3
           python -c "import modal; print('modal version:', getattr(modal,'__version__','?'))"
           python -m modal --help >/dev/null
 
-      # ⬇️ This is the new/fixed auth block
+      # --- Modal auth (fixed: no whoami, dedicated profile) ---
       - name: Configure Modal token (non-interactive)
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
@@ -79,16 +75,12 @@ jobs:
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
           fi
-          # Write credentials to the 'ci' profile
           python -m modal token set \
             --token-id "$MODAL_TOKEN_ID" \
             --token-secret "$MODAL_TOKEN_SECRET" \
             --profile ci
-          # Optional sanity check (not all CLIs have this; ignore failure)
           python -m modal token get --profile ci >/dev/null 2>&1 || true
-          # Use this profile for the rest of the job
           echo "MODAL_PROFILE=ci" >> $GITHUB_ENV
-          # Avoid env override warning
           unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET
 
       - name: Validate entrypoint
@@ -98,8 +90,17 @@ jobs:
             exit 1
           fi
 
-      # ⬇️ This is the new/fixed deploy block using the 'ci' profile
-      - name: Deploy to Modal (retry)
+      # --- Smoke test (fast) before deploy ---
+      # Uses your @app.local_entrypoint (present in your file) to catch import/build issues quickly.
+      - name: Smoke test (modal run)
+        env:
+          MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
+        run: |
+          # This will build the image and run the local entrypoint in Modal's env.
+          python -m modal run "$MODAL_ENTRYPOINT" --profile "$MODAL_PROFILE"
+
+      # --- Deploy (with retry) ---
+      - name: Deploy to Modal
         env:
           MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
           MODAL_ENTRYPOINT: ${{ env.MODAL_ENTRYPOINT }}
@@ -115,3 +116,46 @@ jobs:
             echo "::error::Modal deploy failed after 3 attempts."
             exit 1
           fi
+
+      # ================= Alerts on failure (email + SMS) =================
+      # Email via Resend (optional). Add secrets to enable:
+      #   RESEND_API_KEY, ALERT_EMAIL_FROM, ALERT_EMAIL_TO
+      - name: Send failure email (Resend)
+        if: failure() && env.RESEND_API_KEY != '' && env.ALERT_EMAIL_FROM != '' && env.ALERT_EMAIL_TO != ''
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: |
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY=$(cat <<EOF
+          {
+            "from": "${ALERT_EMAIL_FROM}",
+            "to": ["${ALERT_EMAIL_TO}"],
+            "subject": "❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}",
+            "text": "Workflow failed. Commit: ${GITHUB_SHA::7}\nRun: ${RUN_URL}\nBranch: ${GITHUB_REF_NAME}"
+          }
+          EOF
+          )
+          curl -s -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer ${RESEND_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "${BODY}"
+
+      # SMS via Twilio (optional). Add secrets to enable:
+      #   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM, ALERT_SMS_TO
+      - name: Send failure SMS (Twilio)
+        if: failure() && env.TWILIO_ACCOUNT_SID != '' && env.TWILIO_AUTH_TOKEN != '' && env.TWILIO_FROM != '' && env.ALERT_SMS_TO != ''
+        env:
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          ALERT_SMS_TO: ${{ secrets.ALERT_SMS_TO }}
+        run: |
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MSG="❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME} (${GITHUB_SHA::7}) ${RUN_URL}"
+          curl -s -X POST "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json" \
+            --data-urlencode "From=${TWILIO_FROM}" \
+            --data-urlencode "To=${ALERT_SMS_TO}" \
+            --data-urlencode "Body=${MSG}" \
+            -u "${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}"
