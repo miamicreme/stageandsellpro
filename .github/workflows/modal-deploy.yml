@@ -18,7 +18,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
-  MODAL_ENTRYPOINT: "modal/modal_app.py"
+  MODAL_ENTRYPOINT: "modal/modal_app.py" # change if your entry file is elsewhere
 
 jobs:
   deploy:
@@ -31,13 +31,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python (no cache fallback)
-        # Always set up Python first so the job doesn't fail if no dep files exist
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # Optional pip cache only if dependency files exist
+      # Optional: detect dep files for pip cache
       - name: Determine dependency files
         id: deps
         run: |
@@ -63,14 +62,15 @@ jobs:
             pip install -r requirements.txt || true
           elif [ -f pyproject.toml ]; then
             python -m pip install build || true
-            # If you're using poetry/pdm, add it here. Otherwise skip.
+            # If you use poetry/pdm, add it here (optional)
           fi
-          # Ensure Modal CLI + runtime libs
+          # Modal CLI + libs your code expects
           pip install "modal>=0.56" Pillow==10.3.0 moviepy==1.0.3 supabase==2.4.3
           python -c "import modal; print('modal version:', getattr(modal,'__version__','?'))"
-          python -m modal --help > /dev/null
+          python -m modal --help >/dev/null
 
-      - name: Configure Modal token
+      # ⬇️ This is the new/fixed auth block
+      - name: Configure Modal token (non-interactive)
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
@@ -79,8 +79,17 @@ jobs:
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
           fi
-          python -m modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
-          python -m modal whoami
+          # Write credentials to the 'ci' profile
+          python -m modal token set \
+            --token-id "$MODAL_TOKEN_ID" \
+            --token-secret "$MODAL_TOKEN_SECRET" \
+            --profile ci
+          # Optional sanity check (not all CLIs have this; ignore failure)
+          python -m modal token get --profile ci >/dev/null 2>&1 || true
+          # Use this profile for the rest of the job
+          echo "MODAL_PROFILE=ci" >> $GITHUB_ENV
+          # Avoid env override warning
+          unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET
 
       - name: Validate entrypoint
         run: |
@@ -89,11 +98,15 @@ jobs:
             exit 1
           fi
 
+      # ⬇️ This is the new/fixed deploy block using the 'ci' profile
       - name: Deploy to Modal (retry)
+        env:
+          MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
+          MODAL_ENTRYPOINT: ${{ env.MODAL_ENTRYPOINT }}
         run: |
           n=0
           until [ $n -ge 3 ]; do
-            python -m modal deploy "$MODAL_ENTRYPOINT" && break
+            python -m modal deploy "$MODAL_ENTRYPOINT" --profile "$MODAL_PROFILE" && break
             n=$((n+1))
             echo "Deploy failed (attempt $n). Retrying in 10s..."
             sleep 10
