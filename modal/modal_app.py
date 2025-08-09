@@ -1,350 +1,371 @@
-import os, io, shutil, tempfile, time, json
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Callable
+# modal_app.py
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage & Sell Pro — SDXL + ControlNet virtual staging pipeline on Modal
+# Features:
+# - Correct SDXL + ControlNet setup (Diffusers)
+# - Preloading & shared caching via Modal NetworkFileSystem (HF cache)
+# - GPU acceleration (A10G by default)
+# - Robust error handling for missing weights / OOM / CPU fallback
+# - Single entrypoint `virtual_stage` returning staged JPEG bytes
+#
+# Usage (local/dev):
+#   modal run modal_app.py::warm
+#   modal run modal_app.py::virtual_stage --image /path/empty_room.jpg --room_style "modern luxury"
+#
+# Deployment:
+#   modal deploy modal_app.py
+#
+# Notes:
+# - Ensure you have MODAL_TOKEN_ID / MODAL_TOKEN_SECRET configured locally/CI.
+# - This app uses a shared HF cache named "ssp-hf-cache" so cold-start downloads
+#   happen once and are reused across workers.
+# ──────────────────────────────────────────────────────────────────────────────
+
+from __future__ import annotations
+import io
+import os
+import sys
+import json
+import traceback
+from typing import Optional, Tuple
 
 import modal
-from supabase import create_client, Client
-from PIL import Image, UnidentifiedImageError
 
 # ─────────────────────────── Config / Tunables ───────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
-MAX_EDGE = int(os.getenv("MAX_EDGE", "2048"))          # limit long edge (px)
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "92"))
-POLL_PERIOD_SECONDS = int(os.getenv("POLL_PERIOD_SECONDS", "120"))
-GPU_TYPE = os.getenv("GPU_TYPE", "A10G")               # A10G, A100, H100, or "cpu"
+
+# Hugging Face cache (shared across containers)
 HF_CACHE_NAME = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
 HF_CACHE_MOUNT = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
-ASSETS_BUCKET = os.getenv("ASSETS_BUCKET", "assets")
-UPLOADS_BUCKET = os.getenv("UPLOADS_BUCKET", "uploads")
+
+# Models (override via env if desired)
+SDXL_BASE = os.getenv("SDXL_BASE", "stabilityai/stable-diffusion-xl-base-1.0")
+# Example ControlNet for SDXL (canny variant)
+CONTROLNET_MODEL = os.getenv("CONTROLNET_MODEL", "diffusers/controlnet-canny-sdxl-1.0")
+
+# Inference
+DEFAULT_GUIDANCE = float(os.getenv("GUIDANCE", "5.0"))
+DEFAULT_STEPS = int(os.getenv("STEPS", "28"))
+MAX_EDGE = int(os.getenv("MAX_EDGE", "1536"))  # resize long edge to control VRAM
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "92"))
+
+# GPU selection (A10G by default)
+GPU_TYPE = os.getenv("GPU_TYPE", "A10G").upper()  # A10G, A100, H100 or "CPU"
 
 # ─────────────────────────── Modal App & Image ───────────────────────────────
 app = modal.App(APP_NAME)
 
-# Newer SDK: use from_name(create_if_missing=True)
+# Shared HF cache across workers
 HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
 
+# Build image with required deps. Pin reasonable versions for stability.
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "ffmpeg")
+    modal.Image.debian_slim()
+    .apt_install("ffmpeg")
     .pip_install(
-        # GPU + Diffusers (pinned)
-        "torch==2.2.2", "torchvision==0.17.2", "torchaudio==2.2.2", "xformers==0.0.25",
-        "diffusers==0.28.0", "transformers==4.41.0", "accelerate==0.28.0", "controlnet-aux==0.0.8",
+        # Core
+        "torch==2.3.1",  # CUDA-enabled on GPU runtimes provided by Modal
+        "transformers==4.44.0",
+        "diffusers==0.31.0",
+        "accelerate==0.33.0",
+        "safetensors>=0.4.3",
         # Utils
-        "Pillow==10.3.0", "moviepy==1.0.3", "supabase==2.4.3", "reportlab==4.1.0"
+        "Pillow==10.4.0",
+        "opencv-python-headless==4.10.0.84",
+        "numpy==2.0.1",
     )
-    .env({"HF_HOME": HF_CACHE_MOUNT})  # honor the cache mount
+    # Make sure HF caches to our mounted NFS path
+    .env({
+        "HF_HOME": HF_CACHE_MOUNT,
+        "HUGGINGFACE_HUB_CACHE": HF_CACHE_MOUNT,
+        "TRANSFORMERS_CACHE": HF_CACHE_MOUNT,
+        "DIFFUSERS_CACHE": HF_CACHE_MOUNT,
+        "PYTHONUNBUFFERED": "1",
+    })
 )
 
-def _gpu_resource():
-    # Allow CPU fallback to simplify local tests
-    if GPU_TYPE.lower() == "cpu":
-        return None
-    try:
-        return getattr(modal.gpu, GPU_TYPE)()
-    except Exception:
-        return modal.gpu.A10G()
+# Pick GPU
+if GPU_TYPE == "A100":
+    gpu = modal.gpu.A100()
+elif GPU_TYPE == "H100":
+    gpu = modal.gpu.H100()
+elif GPU_TYPE == "CPU":
+    gpu = None
+else:
+    gpu = modal.gpu.A10G()
 
-# ───────────────────────────── Supabase helpers ──────────────────────────────
-def _sb() -> Client:
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
-    if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
-    return create_client(url, key)
 
-def _public_url(path: str) -> str:
-    base = os.environ["SUPABASE_URL"].rstrip("/")
-    return f"{base}/storage/v1/object/public/{ASSETS_BUCKET}/{path}"
+# ─────────────────────────── Utilities ───────────────────────────────────────
 
-def _retry(fn: Callable, attempts: int = 4, delay: float = 0.8, backoff: float = 1.8):
-    last_err = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except Exception as e:
-            last_err = e
-            time.sleep(delay * (backoff ** i))
-    raise last_err  # bubble up after retries
+def _resize_long_edge(pil_img, max_edge: int):
+    from PIL import Image
 
-def _upload(sb: Client, key: str, data: bytes, mime: str):
-    def _do():
-        sb.storage.from_(ASSETS_BUCKET).upload(
-            key,
-            file=data,
-            file_options={"contentType": mime, "upsert": "true", "cacheControl": "31536000"},
-        )
-    return _retry(_do)
+    w, h = pil_img.size
+    long_edge = max(w, h)
+    if long_edge <= max_edge:
+        return pil_img
+    ratio = max_edge / float(long_edge)
+    new_size = (int(w * ratio), int(h * ratio))
+    return pil_img.resize(new_size, Image.LANCZOS)
 
-def _download_to(sb: Client, src_key: str, dst: Path):
-    def _do():
-        blob = sb.storage.from_(UPLOADS_BUCKET).download(src_key)
-        dst.write_bytes(blob)
-    return _retry(_do)
 
-# ───────────────────────────── Image helpers ─────────────────────────────────
-def _open_downscale(p: Path) -> Optional[Image.Image]:
-    try:
-        img = Image.open(p).convert("RGB")
-    except (UnidentifiedImageError, OSError):
-        return None
-    w, h = img.size
-    m = max(w, h)
-    if m > MAX_EDGE:
-        s = MAX_EDGE / float(m)
-        img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
-    return img
+def _to_jpeg_bytes(pil_img, quality: int = JPEG_QUALITY) -> bytes:
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
-# ───────────────────── SDXL + ControlNet lazy loader ────────────────────────
-from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
-import torch
 
-_PIPE = None
-_DEVICE = None
+def _canny(image_pil) -> "Image.Image":
+    import numpy as np
+    import cv2
+    from PIL import Image
 
-def _select_device() -> Tuple[str, torch.dtype]:
-    if torch.cuda.is_available() and GPU_TYPE.lower() != "cpu":
-        return "cuda", torch.float16
-    # CPU fallback
-    return "cpu", torch.float32
+    img = np.array(image_pil.convert("RGB"))
+    edges = cv2.Canny(img, 100, 200)
+    edges_rgb = np.stack([edges] * 3, axis=-1)
+    return Image.fromarray(edges_rgb)
 
-def get_pipe(style: str = "modern"):
-    """Load & memoize SDXL + depth-ControlNet with CUDA/CPU fallback."""
-    global _PIPE, _DEVICE
-    if _PIPE is None:
-        _DEVICE, dtype = _select_device()
-        print(json.dumps({"event": "pipe_init", "device": _DEVICE, "dtype": str(dtype)}))
-        controlnet = ControlNetModel.from_pretrained(
-            "diffusers/controlnet-depth-sdxl-1.0",
-            torch_dtype=dtype,
-            cache_dir=HF_CACHE_MOUNT,
-        )
-        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            controlnet=controlnet,
-            torch_dtype=dtype,
-            cache_dir=HF_CACHE_MOUNT,
-        )
-        if _DEVICE == "cuda":
-            pipe.enable_xformers_memory_efficient_attention()
-            pipe.to("cuda")
-        else:
-            pipe.enable_attention_slicing()
-            pipe.to("cpu")
-        _PIPE = pipe
 
-    style_map = {
-        "modern": "modern Scandinavian furniture, light wood, airy, neutral palette",
-        "industrial": "industrial loft, exposed brick, metal accents, leather",
-        "contemporary": "contemporary minimalism, clean lines, designer furniture",
-    }
-    _PIPE.default_prompts = {
-        "positive": f"photo-realistic interior, {style_map.get(style, 'modern')}, ultra high detail, 8k",
-        "negative": "blurry, distorted, watermark, text, duplicate, low-quality",
-    }
-    return _PIPE
+# ─────────────────────────── Model Loader (Lazy) ─────────────────────────────
+_pipeline = None  # global cache within container
 
-def _ai_stage(img: Image.Image, style: str) -> Image.Image:
-    pipe = get_pipe(style)
-    # torch autocast only on CUDA float16
-    use_autocast = (_DEVICE == "cuda")
-    kwargs = dict(
-        prompt=pipe.default_prompts["positive"],
-        negative_prompt=pipe.default_prompts["negative"],
-        image=img,
-        strength=0.45,
-        guidance_scale=7.0,
-        num_inference_steps=28,
+
+def _load_pipeline() -> Tuple[object, str]:
+    """Lazy-load SDXL + ControlNet and return (pipeline, device_desc)."""
+    global _pipeline
+    if _pipeline is not None:
+        return _pipeline, "cached"
+
+    import torch
+    from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+
+    # Attempt CUDA first if GPU is present
+    use_cuda = torch.cuda.is_available() and gpu is not None
+    dtype = torch.float16 if use_cuda else torch.float32
+
+    # Load ControlNet and base SDXL
+    controlnet = ControlNetModel.from_pretrained(
+        CONTROLNET_MODEL,
+        torch_dtype=dtype,
+        use_safetensors=True,
+        cache_dir=HF_CACHE_MOUNT,
     )
-    if use_autocast:
-        with torch.autocast("cuda"):
-            out = pipe(**kwargs)
-    else:
-        out = pipe(**kwargs)
-    return out.images[0]
 
-# ───────────────── Flyer (PDF) & Teaser (MP4) builders ──────────────────────
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
-from moviepy.editor import ImageClip, concatenate_videoclips
+    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+        SDXL_BASE,
+        controlnet=controlnet,
+        torch_dtype=dtype,
+        use_safetensors=True,
+        cache_dir=HF_CACHE_MOUNT,
+    )
 
-def _build_flyer(cover_path: Path) -> Path:
-    pdf = cover_path.parent / "flyer.pdf"
-    c = canvas.Canvas(str(pdf), pagesize=letter)
-    W, H = letter
-    cover = Image.open(cover_path)
-    aspect = cover.width / max(1, cover.height)
-    new_h = W / max(0.01, aspect)
-    c.drawImage(ImageReader(cover), 0, H - new_h, width=W, height=new_h, preserveAspectRatio=True, mask='auto')
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(40, H - new_h - 40, "Stage & Sell Pro — Virtual Staging")
-    c.setFont("Helvetica", 12)
-    c.drawString(40, H - new_h - 60, "Generated by AI • 48-hour turnaround")
-    c.showPage()
-    c.save()
-    return pdf
-
-def _build_teaser(staged_paths: List[Path]) -> Path:
-    out = staged_paths[0].parent / "teaser.mp4"
-    clips = []
+    # VAE / Memory tweaks
     try:
-        for p in staged_paths:
-            clip = ImageClip(str(p)).set_duration(2.5)
-            clips.append(clip)
-        video = concatenate_videoclips(clips, method="compose")
-        # Avoid verbose log spam and keep encode fast/compatible
-        video.write_videofile(
-            str(out), fps=24, codec="libx264", audio=False, preset="ultrafast", verbose=False, logger=None
-        )
-    finally:
-        for c in clips:
+        pipe.enable_vae_slicing()
+    except Exception:
+        pass
+    try:
+        pipe.enable_sequential_cpu_offload() if not use_cuda else pipe.enable_model_cpu_offload()
+    except Exception:
+        # Fallback silently if not available
+        pass
+
+    if use_cuda:
+        pipe.to("cuda")
+        device_desc = f"cuda:{torch.cuda.current_device()}"
+    else:
+        device_desc = "cpu"
+
+    _pipeline = pipe
+    return _pipeline, device_desc
+
+
+# ─────────────────────────── Functions ───────────────────────────────────────
+
+@app.function(
+    image=image,
+    timeout=600,
+    retries=2,
+    # Map the HF cache path to the shared NetworkFileSystem
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
+    gpu=gpu,
+)
+def warm() -> str:
+    """Preload models into the shared HF cache and keep a worker warm."""
+    try:
+        pipe, device = _load_pipeline()
+        # Compile a single dummy run to trigger weight init / graph creation
+        from PIL import Image
+        import torch
+
+        dummy = Image.new("RGB", (512, 512), color=(200, 200, 200))
+        canny = _canny(dummy)
+        g = DEFAULT_GUIDANCE
+        steps = max(10, min(DEFAULT_STEPS, 20))
+
+        with torch.inference_mode():
+            _ = pipe(
+                image=canny,
+                prompt="interior design style, photorealistic",
+                negative_prompt="blurry, low quality, watermark",
+                guidance_scale=g,
+                num_inference_steps=steps,
+            )
+        return json.dumps({"status": "ok", "device": device})
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc()})
+
+
+@app.function(
+    image=image,
+    timeout=900,
+    retries=1,
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
+    gpu=gpu,
+)
+def virtual_stage(
+    image: bytes,
+    room_style: str = "modern luxury living room",
+    negative_prompt: str = "lowres, blurry, bad anatomy, watermark, text",
+    seed: Optional[int] = None,
+    guidance_scale: Optional[float] = None,
+    num_inference_steps: Optional[int] = None,
+) -> bytes:
+    """
+    Virtual stage an empty room photo using SDXL + ControlNet (canny guidance).
+
+    Args:
+        image: Raw bytes (JPEG/PNG) of the empty room photo.
+        room_style: Prompt describing the desired staging style.
+        negative_prompt: Negative prompt to avoid.
+        seed: Optional RNG seed for deterministic output.
+        guidance_scale: CFG guidance (default from env if None).
+        num_inference_steps: Diffusion steps (default from env if None).
+
+    Returns:
+        JPEG bytes of the staged image.
+    """
+    from PIL import Image
+    import torch
+
+    g = guidance_scale if guidance_scale is not None else DEFAULT_GUIDANCE
+    steps = num_inference_steps if num_inference_steps is not None else DEFAULT_STEPS
+
+    try:
+        # Load the pipeline (lazy)
+        pipe, device = _load_pipeline()
+
+        # Decode + resize
+        inp = Image.open(io.BytesIO(image)).convert("RGB")
+        inp = _resize_long_edge(inp, MAX_EDGE)
+
+        # Build ControlNet conditioning via Canny
+        control = _canny(inp)
+
+        # Reproducibility
+        generator = None
+        if seed is not None:
             try:
-                c.close()
+                generator = torch.Generator(device=device).manual_seed(int(seed))
             except Exception:
-                pass
+                generator = torch.Generator().manual_seed(int(seed))
+
+        # Inference
+        with torch.inference_mode():
+            result = pipe(
+                image=control,
+                prompt=f"{room_style}, photorealistic, high detail, interior design, furniture staging, ray-traced lighting, 8k",
+                negative_prompt=negative_prompt,
+                generator=generator,
+                guidance_scale=g,
+                num_inference_steps=steps,
+            )
+
+        # Diffusers returns a PipelineOutput with images list
+        out_img = result.images[0]
+
+        # Subtle blend with original structure (optional):
+        # Keep 10% of original to reduce artifacts on walls/floor
         try:
-            video.close()  # type: ignore
+            import numpy as np
+            alpha = 0.9
+            out_np = np.array(out_img).astype("float32")
+            in_np = np.array(inp).astype("float32")
+            blend_np = (alpha * out_np + (1 - alpha) * in_np).clip(0, 255).astype("uint8")
+            out_img = Image.fromarray(blend_np)
         except Exception:
             pass
-    return out
 
-def _already(job: Dict[str, Any]) -> bool:
-    assets = job.get("assets") or {}
-    return any(str(k).startswith("staged_") for k in assets.keys())
+        return _to_jpeg_bytes(out_img, JPEG_QUALITY)
 
-def _validate_job(job: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    if not isinstance(job, dict):
-        return False, "invalid_job_payload"
-    if "id" not in job:
-        return False, "missing_job_id"
-    files = job.get("files")
-    if not files or not isinstance(files, list):
-        return False, "no_files"
-    return True, None
+    except Exception as e:
+        # Granular CUDA OOM handling
+        err_msg = str(e)
+        is_cuda_oom = any(s in err_msg.lower() for s in ["cuda out of memory", "cublas", "cudnn"]) or (
+            hasattr(torch, "cuda") and torch.cuda.is_available() and isinstance(e, RuntimeError) and "out of memory" in err_msg.lower()
+        )
 
-# ───────────────────────────── Worker functions ──────────────────────────────
-@app.function(
-    image=image,
-    gpu=_gpu_resource(),
-    timeout=1200,
-    cpu=4.0,
-    memory=16384,  # 16GB – SDXL w/ ControlNet is heavy; tune as needed
-    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
-    secrets=[modal.Secret.from_name("supabase-creds")],
-)
-def process_job(job: Dict[str, Any]) -> str:
-    ok, reason = _validate_job(job)
-    if not ok:
-        print(json.dumps({"event": "reject", "reason": reason}))
-        return reason or "invalid"
-
-    if _already(job):
-        print(json.dumps({"event": "skip_already", "job_id": job["id"]}))
-        return f"skip {job['id']} (already delivered)"
-
-    sb: Client = _sb()
-    job_id = job["id"]
-    tmp = Path(tempfile.mkdtemp(prefix=f"ssp_{job_id}_"))
-    print(json.dumps({"event": "start", "job_id": job_id, "files": job.get("files", [])}))
-    try:
-        style = job.get("style", "modern")
-        staged_paths: List[Path] = []
-        assets: Dict[str, str] = {}
-
-        files = job.get("files") or []
-        for i, rel in enumerate(files, 1):
-            local = tmp / Path(str(rel)).name
+        # Attempt a lower-res fallback if OOM
+        if is_cuda_oom:
             try:
-                _download_to(sb, rel, local)
-                img = _open_downscale(local)
-                if img is None:
-                    print(json.dumps({"event": "bad_image", "src": rel}))
-                    continue
-            except Exception as e:
-                print(json.dumps({"event": "download_error", "src": rel, "error": str(e)}))
-                continue
+                small = _resize_long_edge(Image.open(io.BytesIO(image)).convert("RGB"), max(1024, MAX_EDGE // 2))
+                control_small = _canny(small)
+                pipe, device = _load_pipeline()
+                with torch.inference_mode():
+                    result = pipe(
+                        image=control_small,
+                        prompt=f"{room_style}, photorealistic, interior design, furniture staging",
+                        negative_prompt=negative_prompt,
+                        guidance_scale=max(4.0, g - 1.0),
+                        num_inference_steps=max(18, steps - 6),
+                    )
+                out_img = result.images[0]
+                return _to_jpeg_bytes(out_img, JPEG_QUALITY)
+            except Exception:
+                pass
 
-            # BEFORE
-            bbuf = io.BytesIO()
-            img.save(bbuf, "JPEG", quality=JPEG_QUALITY)
-            bbuf.seek(0)
-            before_key = f"{job_id}/before_{i:02d}.jpg"
-            _upload(sb, before_key, bbuf.getvalue(), "image/jpeg")
-            assets[f"before_{i:02d}"] = _public_url(before_key)
+        # If we reach here, bubble a structured error back to caller
+        tb = traceback.format_exc()
+        err = {
+            "error": "virtual_stage_failed",
+            "message": err_msg,
+            "trace": tb,
+            "hints": [
+                "Confirm GPU is available or set GPU_TYPE=CPU for CPU fallback (slow).",
+                f"Try reducing MAX_EDGE (currently {MAX_EDGE}).",
+                "Lower num_inference_steps or guidance_scale.",
+                "Ensure models are accessible; run warm() once to preload/cached.",
+            ],
+        }
+        return json.dumps(err).encode("utf-8")
 
-            # AFTER (AI staging)
-            try:
-                staged = _ai_stage(img, style)
-            except Exception as e:
-                print(json.dumps({"event": "ai_stage_error", "index": i, "error": str(e)}))
-                continue
 
-            abuf = io.BytesIO()
-            staged.save(abuf, "JPEG", quality=JPEG_QUALITY)
-            abuf.seek(0)
-            after_key = f"{job_id}/staged_{i:02d}.jpg"
-            _upload(sb, after_key, abuf.getvalue(), "image/jpeg")
-            assets[f"staged_{i:02d}"] = _public_url(after_key)
-
-            out_local = tmp / f"staged_{i:02d}.jpg"
-            staged.save(out_local, "JPEG", quality=JPEG_QUALITY)
-            staged_paths.append(out_local)
-
-        if not staged_paths:
-            sb.table("jobs").update({"status": "error", "assets": {"reason": "no_valid_images"}}).eq("id", job_id).execute()
-            print(json.dumps({"event": "end_error", "job_id": job_id, "reason": "no_valid_images"}))
-            return "no-valid-images"
-
-        # Flyer + teaser
-        flyer = _build_flyer(staged_paths[0])
-        _upload(sb, f"{job_id}/flyer.pdf", flyer.read_bytes(), "application/pdf")
-        assets["flyer"] = _public_url(f"{job_id}/flyer.pdf")
-
-        teaser = _build_teaser(staged_paths)
-        _upload(sb, f"{job_id}/teaser.mp4", teaser.read_bytes(), "video/mp4")
-        assets["teaser"] = _public_url(f"{job_id}/teaser.mp4")
-
-        assets.setdefault("flyer_cover", assets.get("staged_01", next(iter(assets.values()))))
-
-        # Finish
-        sb.table("jobs").update({"status": "delivered", "assets": assets}).eq("id", job_id).execute()
-        print(json.dumps({"event": "end_ok", "job_id": job_id, "assets": list(assets.keys())}))
-        return f"delivered {job_id}"
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-@app.function(
-    image=image,
-    schedule=modal.Period(seconds=POLL_PERIOD_SECONDS),  # every N seconds
-    secrets=[modal.Secret.from_name("supabase-creds")],
-    cpu=1.0,
-    memory=1024,
-)
-def poll_and_process() -> str:
-    """Claim one queued job safely and spawn a GPU worker."""
-    sb = _sb()
-
-    # Get oldest queued job id
-    res = sb.table("jobs").select("id").eq("status", "queued").order("created_at", desc=False).limit(1).execute()
-    rows = res.data or []
-    if not rows:
-        return "no-queued-jobs"
-
-    job_id = rows[0]["id"]
-
-    # Try to atomically claim it by updating only if still queued
-    upd = sb.table("jobs").update({"status": "processing"}).eq("id", job_id).eq("status", "queued").execute()
-    # Some Supabase clients return data only if select() is used; we just re-check:
-    claimed = sb.table("jobs").select("status").eq("id", job_id).limit(1).execute().data[0]["status"] == "processing"
-    if not claimed:
-        return f"race-lost {job_id}"
-
-    # Fetch the full job payload
-    job = sb.table("jobs").select("*").eq("id", job_id).single().execute().data
-    process_job.spawn(job)  # fire-and-forget on GPU runner
-    return f"spawned {job_id}"
+# ─────────────────────────── Local Entrypoints (CLI Helpers) ─────────────────
 
 @app.local_entrypoint()
-def run_local_test():
-    print("Local test entry — OK. Set GPU_TYPE=cpu to test CPU path.")
+def _demo_virtual_stage(image: str, room_style: str = "modern luxury"):
+    """Local convenience to test with a file path. Writes out staged_output.jpg"""
+    with open(image, "rb") as f:
+        data = f.read()
+    out = virtual_stage.remote(data, room_style)
+
+    # Handle structured error payloads
+    try:
+        # If output decodes as JSON error, print and exit
+        maybe = json.loads(out.decode("utf-8"))
+        if isinstance(maybe, dict) and maybe.get("error"):
+            print("Error:", json.dumps(maybe, indent=2))
+            sys.exit(1)
+    except Exception:
+        pass
+
+    out_path = "staged_output.jpg"
+    with open(out_path, "wb") as f:
+        f.write(out)
+    print(f"Saved → {out_path}")
+
+
+@app.local_entrypoint()
+def _warm():
+    """Local call to warm() for cache preloading during development."""
+    print(warm.remote())
