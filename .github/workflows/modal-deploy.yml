@@ -1,35 +1,58 @@
 name: Modal Deploy
+
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
+    # Re-deploy when Modal code or env-affecting files change
     paths:
-      - 'modal/**'
-      - '.github/workflows/modal-deploy.yml'
+      - "modal/**"
+      - "modal_app.py"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "poetry.lock"
+      - ".github/workflows/modal-deploy.yml"
+
+concurrency:
+  group: modal-deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Modal CLI + deps
         run: |
           python -m pip install --upgrade pip
-          # Install the CLI-capable package
+          # Pin or bump as needed
           python -m pip install "modal>=0.56" Pillow==10.3.0 moviepy==1.0.3 supabase==2.4.3
           # Sanity checks
           python -c "import modal; print('modal version:', getattr(modal,'__version__','?'))"
           python -m modal --help > /dev/null
 
-      - name: Deploy to Modal
+      - name: Configure Modal token (non-interactive)
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          # Persist credentials for the CLI in CI
+          python -m modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
+          python -m modal whoami
+
+      - name: Deploy to Modal
+        # If your entry file is at modal/modal_app.py keep as-is;
+        # otherwise change the path below.
         run: |
           python -m modal deploy modal/modal_app.py
