@@ -1,49 +1,86 @@
-import os, io, shutil, tempfile
+import os, io, shutil, tempfile, time, json
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple, Callable
 
 import modal
 from supabase import create_client, Client
 from PIL import Image, UnidentifiedImageError
 
+# ─────────────────────────── Config / Tunables ───────────────────────────────
+APP_NAME = "stage-sell-pro-pipeline"
+MAX_EDGE = int(os.getenv("MAX_EDGE", "2048"))          # limit long edge (px)
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "92"))
+POLL_PERIOD_SECONDS = int(os.getenv("POLL_PERIOD_SECONDS", "120"))
+GPU_TYPE = os.getenv("GPU_TYPE", "A10G")               # A10G, A100, H100, or "cpu"
+HF_CACHE_NAME = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
+HF_CACHE_MOUNT = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
+ASSETS_BUCKET = os.getenv("ASSETS_BUCKET", "assets")
+UPLOADS_BUCKET = os.getenv("UPLOADS_BUCKET", "uploads")
+
 # ─────────────────────────── Modal App & Image ───────────────────────────────
-app = modal.App("stage-sell-pro-pipeline")
+app = modal.App(APP_NAME)
+
+# Newer SDK: use from_name(create_if_missing=True)
+HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "ffmpeg")
     .pip_install(
-        # GPU + Diffusers
+        # GPU + Diffusers (pinned)
         "torch==2.2.2", "torchvision==0.17.2", "torchaudio==2.2.2", "xformers==0.0.25",
         "diffusers==0.28.0", "transformers==4.41.0", "accelerate==0.28.0", "controlnet-aux==0.0.8",
         # Utils
         "Pillow==10.3.0", "moviepy==1.0.3", "supabase==2.4.3", "reportlab==4.1.0"
     )
+    .env({"HF_HOME": HF_CACHE_MOUNT})  # honor the cache mount
 )
 
-# Cache models between runs so the first cold start is the only download
-HF_CACHE = modal.NetworkFileSystem.persisted("ssp-hf-cache")
-
-# Tunables
-MAX_EDGE = 2048          # downscale long edge to keep memory/latency sane
-JPEG_QUALITY = 92
+def _gpu_resource():
+    # Allow CPU fallback to simplify local tests
+    if GPU_TYPE.lower() == "cpu":
+        return None
+    try:
+        return getattr(modal.gpu, GPU_TYPE)()
+    except Exception:
+        return modal.gpu.A10G()
 
 # ───────────────────────────── Supabase helpers ──────────────────────────────
 def _sb() -> Client:
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+    return create_client(url, key)
 
 def _public_url(path: str) -> str:
     base = os.environ["SUPABASE_URL"].rstrip("/")
-    return f"{base}/storage/v1/object/public/assets/{path}"
+    return f"{base}/storage/v1/object/public/{ASSETS_BUCKET}/{path}"
+
+def _retry(fn: Callable, attempts: int = 4, delay: float = 0.8, backoff: float = 1.8):
+    last_err = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            time.sleep(delay * (backoff ** i))
+    raise last_err  # bubble up after retries
 
 def _upload(sb: Client, key: str, data: bytes, mime: str):
-    sb.storage.from_("assets").upload(
-        key, file=data,
-        file_options={"contentType": mime, "upsert": "true", "cacheControl": "31536000"}
-    )
+    def _do():
+        sb.storage.from_(ASSETS_BUCKET).upload(
+            key,
+            file=data,
+            file_options={"contentType": mime, "upsert": "true", "cacheControl": "31536000"},
+        )
+    return _retry(_do)
 
 def _download_to(sb: Client, src_key: str, dst: Path):
-    dst.write_bytes(sb.storage.from_("uploads").download(src_key))
+    def _do():
+        blob = sb.storage.from_(UPLOADS_BUCKET).download(src_key)
+        dst.write_bytes(blob)
+    return _retry(_do)
 
 # ───────────────────────────── Image helpers ─────────────────────────────────
 def _open_downscale(p: Path) -> Optional[Image.Image]:
@@ -63,22 +100,38 @@ from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
 import torch
 
 _PIPE = None
+_DEVICE = None
+
+def _select_device() -> Tuple[str, torch.dtype]:
+    if torch.cuda.is_available() and GPU_TYPE.lower() != "cpu":
+        return "cuda", torch.float16
+    # CPU fallback
+    return "cpu", torch.float32
+
 def get_pipe(style: str = "modern"):
-    """Load & memoize SDXL + depth-ControlNet (fp16, CUDA)."""
-    global _PIPE
+    """Load & memoize SDXL + depth-ControlNet with CUDA/CPU fallback."""
+    global _PIPE, _DEVICE
     if _PIPE is None:
+        _DEVICE, dtype = _select_device()
+        print(json.dumps({"event": "pipe_init", "device": _DEVICE, "dtype": str(dtype)}))
         controlnet = ControlNetModel.from_pretrained(
             "diffusers/controlnet-depth-sdxl-1.0",
-            torch_dtype=torch.float16,
-            cache_dir="/root/.cache/huggingface",
+            torch_dtype=dtype,
+            cache_dir=HF_CACHE_MOUNT,
         )
-        _PIPE = StableDiffusionXLControlNetPipeline.from_pretrained(
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             "stabilityai/stable-diffusion-xl-base-1.0",
             controlnet=controlnet,
-            torch_dtype=torch.float16,
-            cache_dir="/root/.cache/huggingface",
-        ).to("cuda")
-        _PIPE.enable_xformers_memory_efficient_attention()
+            torch_dtype=dtype,
+            cache_dir=HF_CACHE_MOUNT,
+        )
+        if _DEVICE == "cuda":
+            pipe.enable_xformers_memory_efficient_attention()
+            pipe.to("cuda")
+        else:
+            pipe.enable_attention_slicing()
+            pipe.to("cpu")
+        _PIPE = pipe
 
     style_map = {
         "modern": "modern Scandinavian furniture, light wood, airy, neutral palette",
@@ -93,14 +146,21 @@ def get_pipe(style: str = "modern"):
 
 def _ai_stage(img: Image.Image, style: str) -> Image.Image:
     pipe = get_pipe(style)
-    out = pipe(
+    # torch autocast only on CUDA float16
+    use_autocast = (_DEVICE == "cuda")
+    kwargs = dict(
         prompt=pipe.default_prompts["positive"],
         negative_prompt=pipe.default_prompts["negative"],
-        image=img,                    # img2img keeps geometry
+        image=img,
         strength=0.45,
         guidance_scale=7.0,
         num_inference_steps=28,
     )
+    if use_autocast:
+        with torch.autocast("cuda"):
+            out = pipe(**kwargs)
+    else:
+        out = pipe(**kwargs)
     return out.images[0]
 
 # ───────────────── Flyer (PDF) & Teaser (MP4) builders ──────────────────────
@@ -114,113 +174,78 @@ def _build_flyer(cover_path: Path) -> Path:
     c = canvas.Canvas(str(pdf), pagesize=letter)
     W, H = letter
     cover = Image.open(cover_path)
-    aspect = cover.width / cover.height
-    new_h = W / aspect
-    c.drawImage(ImageReader(cover), 0, H - new_h, width=W, height=new_h)
+    aspect = cover.width / max(1, cover.height)
+    new_h = W / max(0.01, aspect)
+    c.drawImage(ImageReader(cover), 0, H - new_h, width=W, height=new_h, preserveAspectRatio=True, mask='auto')
     c.setFont("Helvetica-Bold", 18)
     c.drawString(40, H - new_h - 40, "Stage & Sell Pro — Virtual Staging")
     c.setFont("Helvetica", 12)
     c.drawString(40, H - new_h - 60, "Generated by AI • 48-hour turnaround")
-    c.showPage(); c.save()
+    c.showPage()
+    c.save()
     return pdf
 
 def _build_teaser(staged_paths: List[Path]) -> Path:
     out = staged_paths[0].parent / "teaser.mp4"
-    clips = [ImageClip(str(p)).set_duration(2.5) for p in staged_paths]
-    video = concatenate_videoclips(clips, method="compose")
-    video.write_videofile(str(out), fps=24, codec="libx264", audio=False, preset="ultrafast", logger=None)
+    clips = []
+    try:
+        for p in staged_paths:
+            clip = ImageClip(str(p)).set_duration(2.5)
+            clips.append(clip)
+        video = concatenate_videoclips(clips, method="compose")
+        # Avoid verbose log spam and keep encode fast/compatible
+        video.write_videofile(
+            str(out), fps=24, codec="libx264", audio=False, preset="ultrafast", verbose=False, logger=None
+        )
+    finally:
+        for c in clips:
+            try:
+                c.close()
+            except Exception:
+                pass
+        try:
+            video.close()  # type: ignore
+        except Exception:
+            pass
     return out
 
 def _already(job: Dict[str, Any]) -> bool:
-    return any(k.startswith("staged_") for k in (job.get("assets") or {}))
+    assets = job.get("assets") or {}
+    return any(str(k).startswith("staged_") for k in assets.keys())
+
+def _validate_job(job: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    if not isinstance(job, dict):
+        return False, "invalid_job_payload"
+    if "id" not in job:
+        return False, "missing_job_id"
+    files = job.get("files")
+    if not files or not isinstance(files, list):
+        return False, "no_files"
+    return True, None
 
 # ───────────────────────────── Worker functions ──────────────────────────────
 @app.function(
     image=image,
-    gpu="A10G",
-    timeout=900,
-    mounts={"/root/.cache/huggingface": HF_CACHE},
+    gpu=_gpu_resource(),
+    timeout=1200,
+    cpu=4.0,
+    memory=16384,  # 16GB – SDXL w/ ControlNet is heavy; tune as needed
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
     secrets=[modal.Secret.from_name("supabase-creds")],
 )
 def process_job(job: Dict[str, Any]) -> str:
-    sb, job_id = _sb(), job["id"]
+    ok, reason = _validate_job(job)
+    if not ok:
+        print(json.dumps({"event": "reject", "reason": reason}))
+        return reason or "invalid"
+
     if _already(job):
-        return f"skip {job_id} (already delivered)"
+        print(json.dumps({"event": "skip_already", "job_id": job["id"]}))
+        return f"skip {job['id']} (already delivered)"
 
-    files = job.get("files") or []
-    if not files:
-        sb.table("jobs").update({"status": "error", "assets": {"reason": "no_files"}}).eq("id", job_id).execute()
-        return "no-files"
-
-    tmp = Path(tempfile.mkdtemp())
+    sb: Client = _sb()
+    job_id = job["id"]
+    tmp = Path(tempfile.mkdtemp(prefix=f"ssp_{job_id}_"))
+    print(json.dumps({"event": "start", "job_id": job_id, "files": job.get("files", [])}))
     try:
-        style = job.get("style", "modern")
-        staged_paths: List[Path] = []
-        assets: Dict[str, str] = {}
-
-        # Process each uploaded source
-        for i, rel in enumerate(files, 1):
-            local = tmp / Path(rel).name
-            _download_to(sb, rel, local)
-            img = _open_downscale(local)
-            if img is None:
-                continue
-
-            # BEFORE: upload original as JPEG
-            bbuf = io.BytesIO(); img.save(bbuf, "JPEG", quality=JPEG_QUALITY); bbuf.seek(0)
-            before_key = f"{job_id}/before_{i:02d}.jpg"
-            _upload(sb, before_key, bbuf.getvalue(), "image/jpeg")
-            assets[f"before_{i:02d}"] = _public_url(before_key)
-
-            # AFTER: AI staging
-            staged = _ai_stage(img, style)
-            abuf = io.BytesIO(); staged.save(abuf, "JPEG", quality=JPEG_QUALITY); abuf.seek(0)
-            after_key = f"{job_id}/staged_{i:02d}.jpg"
-            _upload(sb, after_key, abuf.getvalue(), "image/jpeg")
-            assets[f"staged_{i:02d}"] = _public_url(after_key)
-
-            # Save local copy for video/flyer
-            out_local = tmp / f"staged_{i:02d}.jpg"
-            staged.save(out_local, "JPEG", quality=JPEG_QUALITY)
-            staged_paths.append(out_local)
-
-        if not staged_paths:
-            sb.table("jobs").update({"status": "error", "assets": {"reason": "no_valid_images"}}).eq("id", job_id).execute()
-            return "no-valid-images"
-
-        # Flyer + teaser
-        flyer = _build_flyer(staged_paths[0])
-        _upload(sb, f"{job_id}/flyer.pdf", flyer.read_bytes(), "application/pdf")
-        assets["flyer"] = _public_url(f"{job_id}/flyer.pdf")
-
-        teaser = _build_teaser(staged_paths)
-        _upload(sb, f"{job_id}/teaser.mp4", teaser.read_bytes(), "video/mp4")
-        assets["teaser"] = _public_url(f"{job_id}/teaser.mp4")
-
-        assets.setdefault("flyer_cover", assets.get("staged_01", next(iter(assets.values()))))
-
-        # Finish
-        sb.table("jobs").update({"status": "delivered", "assets": assets}).eq("id", job_id).execute()
-        return f"delivered {job_id}"
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-@app.function(
-    image=image,
-    schedule=modal.Period(seconds=120),  # every 2 minutes
-    secrets=[modal.Secret.from_name("supabase-creds")],
-)
-def poll_and_process() -> str:
-    sb = _sb()
-    res = sb.table("jobs").select("*").eq("status", "queued").order("created_at", desc=False).limit(1).execute()
-    rows = res.data or []
-    if not rows:
-        return "no-queued-jobs"
-    job = rows[0]
-    sb.table("jobs").update({"status": "processing"}).eq("id", job["id"]).execute()
-    process_job.spawn(job)
-    return f"spawned {job['id']}"
-
-@app.local_entrypoint()
-def run_local_test():
-    print("Local test entry (no files) — structure OK")
+        style = job.get("style", "m
