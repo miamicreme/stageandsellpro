@@ -4,13 +4,17 @@
 # Features:
 # - Correct SDXL + ControlNet setup (Diffusers)
 # - Preloading & shared caching via Modal NetworkFileSystem (HF cache)
-# - GPU acceleration (A10G by default)
+# - GPU acceleration (A10G by default) using the new string API (e.g. gpu="A10G")
 # - Robust error handling for missing weights / OOM / CPU fallback
 # - Single entrypoint `virtual_stage` returning staged JPEG bytes
+# - Friendly `main` local entrypoint so `modal run modal_app.py` shows usage/help
 #
-# Usage (local/dev):
-#   modal run modal_app.py::warm
-#   modal run modal_app.py::virtual_stage --image /path/empty_room.jpg --room_style "modern luxury"
+# Quick usage (dev):
+#   modal run modal_app.py::main                   # prints help and options
+#   modal run modal_app.py::warm                   # pre-pull & warm models
+#   modal run modal_app.py::_demo_virtual_stage \
+#       --image /path/empty_room.jpg \
+#       --room_style "modern luxury"
 #
 # Deployment:
 #   modal deploy modal_app.py
@@ -49,8 +53,11 @@ DEFAULT_STEPS = int(os.getenv("STEPS", "28"))
 MAX_EDGE = int(os.getenv("MAX_EDGE", "1536"))  # resize long edge to control VRAM
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "92"))
 
-# GPU selection (A10G by default)
+# GPU selection (A10G by default) — use new string API to avoid deprecation
 GPU_TYPE = os.getenv("GPU_TYPE", "A10G").upper()  # A10G, A100, H100 or "CPU"
+if GPU_TYPE not in {"A10G", "A100", "H100", "CPU"}:
+    GPU_TYPE = "A10G"
+GPU_ARG: Optional[str] = None if GPU_TYPE == "CPU" else GPU_TYPE
 
 # ─────────────────────────── Modal App & Image ───────────────────────────────
 app = modal.App(APP_NAME)
@@ -83,17 +90,6 @@ image = (
         "PYTHONUNBUFFERED": "1",
     })
 )
-
-# Pick GPU
-if GPU_TYPE == "A100":
-    gpu = modal.gpu.A100()
-elif GPU_TYPE == "H100":
-    gpu = modal.gpu.H100()
-elif GPU_TYPE == "CPU":
-    gpu = None
-else:
-    gpu = modal.gpu.A10G()
-
 
 # ─────────────────────────── Utilities ───────────────────────────────────────
 
@@ -140,7 +136,7 @@ def _load_pipeline() -> Tuple[object, str]:
     from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
 
     # Attempt CUDA first if GPU is present
-    use_cuda = torch.cuda.is_available() and gpu is not None
+    use_cuda = torch.cuda.is_available() and (GPU_ARG is not None)
     dtype = torch.float16 if use_cuda else torch.float32
 
     # Load ControlNet and base SDXL
@@ -188,7 +184,7 @@ def _load_pipeline() -> Tuple[object, str]:
     retries=2,
     # Map the HF cache path to the shared NetworkFileSystem
     network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
-    gpu=gpu,
+    gpu=GPU_ARG,  # <- use new string API (e.g. "A10G") or None for CPU
 )
 def warm() -> str:
     """Preload models into the shared HF cache and keep a worker warm."""
@@ -211,7 +207,7 @@ def warm() -> str:
                 guidance_scale=g,
                 num_inference_steps=steps,
             )
-        return json.dumps({"status": "ok", "device": device})
+        return json.dumps({"status": "ok", "device": device, "gpu": GPU_ARG or "CPU"})
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc()})
 
@@ -221,7 +217,7 @@ def warm() -> str:
     timeout=900,
     retries=1,
     network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
-    gpu=gpu,
+    gpu=GPU_ARG,
 )
 def virtual_stage(
     image: bytes,
@@ -341,6 +337,36 @@ def virtual_stage(
 
 
 # ─────────────────────────── Local Entrypoints (CLI Helpers) ─────────────────
+
+@app.local_entrypoint()
+def main(command: str = "help", image: str = "", room_style: str = "modern luxury"):
+    """Friendly launcher. Example:
+      modal run modal_app.py::main --command warm
+      modal run modal_app.py::main --command demo --image /path/img.jpg --room_style "modern luxury"
+    """
+    if command == "help":
+        print(
+            "\nStage & Sell Pro — commands:\n"
+            "  • warm  → pre-download models and warm a worker\n"
+            "  • demo  → run local demo on a file (writes staged_output.jpg)\n\n"
+            "Examples:\n"
+            "  modal run modal_app.py::warm\n"
+            "  modal run modal_app.py::_demo_virtual_stage --image /path/empty_room.jpg --room_style 'modern luxury'\n"
+            "  modal run modal_app.py::main --command demo --image /path/empty_room.jpg\n"
+        )
+        return
+    if command == "warm":
+        print(warm.remote())
+        return
+    if command == "demo":
+        if not image:
+            print("Missing --image /path/to/file.jpg for demo")
+            sys.exit(2)
+        _demo_virtual_stage.local(image=image, room_style=room_style)
+        return
+    print(f"Unknown command: {command}")
+    sys.exit(2)
+
 
 @app.local_entrypoint()
 def _demo_virtual_stage(image: str, room_style: str = "modern luxury"):
