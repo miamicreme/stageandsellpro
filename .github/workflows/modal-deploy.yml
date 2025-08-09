@@ -4,13 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches: [ main, master, develop ]
-    # Only redeploy when code or build inputs change
     paths:
       - "modal/**"
       - "modal_app.py"
-      - "requirements.txt"
-      - "pyproject.toml"
-      - "poetry.lock"
       - ".github/workflows/modal-deploy.yml"
 
 concurrency:
@@ -21,11 +17,8 @@ permissions:
   contents: read
 
 env:
-  # Default entry point. Change if your main file lives elsewhere.
-  MODAL_ENTRYPOINT: modal/modal_app.py
   PYTHON_VERSION: "3.11"
-  # Optional: adjust if your build is heavy
-  PIP_CACHE_DIR: ~/.cache/pip
+  MODAL_ENTRYPOINT: "modal/modal_app.py"
 
 jobs:
   deploy:
@@ -38,45 +31,46 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select environment (staging vs prod)
-        id: envsel
-        run: |
-          if [[ "${GITHUB_REF##*/}" == "develop" ]]; then
-            echo "stage=staging" >> "$GITHUB_OUTPUT"
-          else
-            echo "stage=production" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Validate Modal entrypoint exists
-        run: |
-          if [ ! -f "$MODAL_ENTRYPOINT" ]; then
-            echo "::error file=$MODAL_ENTRYPOINT::Modal entrypoint not found"
-            exit 1
-          fi
-
-      - name: Setup Python
+      - name: Setup Python (no cache fallback)
+        # Always set up Python first so the job doesn't fail if no dep files exist
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: "pip"
-          cache-dependency-path: |
-            requirements.txt
-            pyproject.toml
-            poetry.lock
+
+      # Optional pip cache only if dependency files exist
+      - name: Determine dependency files
+        id: deps
+        run: |
+          FILES=$(ls requirements*.txt 2>/dev/null || true)
+          if [ -f pyproject.toml ]; then FILES="$FILES pyproject.toml"; fi
+          if [ -f poetry.lock ]; then FILES="$FILES poetry.lock"; fi
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pip
+        if: steps.deps.outputs.files != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles(steps.deps.outputs.files) }}
+          restore-keys: |
+            pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Install your project deps if present
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+          # Install your project deps if present (optional)
+          if ls requirements*.txt >/dev/null 2>&1; then
+            pip install -r requirements.txt || true
+          elif [ -f pyproject.toml ]; then
+            python -m pip install build || true
+            # If you're using poetry/pdm, add it here. Otherwise skip.
           fi
-          # Ensure Modal CLI + any runtime libs are present
+          # Ensure Modal CLI + runtime libs
           pip install "modal>=0.56" Pillow==10.3.0 moviepy==1.0.3 supabase==2.4.3
           python -c "import modal; print('modal version:', getattr(modal,'__version__','?'))"
           python -m modal --help > /dev/null
 
-      - name: Configure Modal token (non-interactive)
+      - name: Configure Modal token
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
@@ -88,20 +82,17 @@ jobs:
           python -m modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
           python -m modal whoami
 
-      # Optional: set env vars for your app (passed via environment)
-      # - name: Export app environment
-      #   run: |
-      #     echo "APP_ENV=${{ steps.envsel.outputs.stage }}" >> $GITHUB_ENV
-
-      - name: Deploy to Modal (with retry)
-        env:
-          APP_ENV: ${{ steps.envsel.outputs.stage }}
+      - name: Validate entrypoint
         run: |
-          echo "Deploying ${APP_ENV} -> $MODAL_ENTRYPOINT"
-          # Simple retry for transient failures
+          if [ ! -f "$MODAL_ENTRYPOINT" ]; then
+            echo "::error file=$MODAL_ENTRYPOINT::Modal entrypoint not found"
+            exit 1
+          fi
+
+      - name: Deploy to Modal (retry)
+        run: |
           n=0
-          until [ $n -ge 3 ]
-          do
+          until [ $n -ge 3 ]; do
             python -m modal deploy "$MODAL_ENTRYPOINT" && break
             n=$((n+1))
             echo "Deploy failed (attempt $n). Retrying in 10s..."
