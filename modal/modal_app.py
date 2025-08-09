@@ -18,7 +18,7 @@
 #       --room_style "modern luxury"
 #
 # Deployment:
-#   modal deploy modal_app.py
+#   python -m modal deploy modal_app.py
 #
 # Notes:
 # - Ensure you have MODAL_TOKEN_ID / MODAL_TOKEN_SECRET configured locally/CI.
@@ -37,7 +37,8 @@ import traceback
 from typing import Optional, Tuple
 
 import modal
-from modal import web, Response
+from modal import asgi_app
+from fastapi import FastAPI, Request, Response
 
 # ─────────────────────────── Config / Tunables ───────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
@@ -83,6 +84,9 @@ image = (
         "diffusers==0.31.0",
         "accelerate==0.33.0",
         "safetensors>=0.4.3",
+        # Web server
+        "fastapi==0.111.0",
+        "uvicorn==0.30.0",
         # Utils
         "Pillow==10.4.0",
         "opencv-python-headless==4.10.0.84",
@@ -345,97 +349,98 @@ def virtual_stage(
         return json.dumps(err).encode("utf-8")
 
 
-# ─────────────────────────── HTTP Web Endpoint (/stage) ──────────────────────
-# Accepts either:
-#  • multipart/form-data: field name "file" (binary), optional "room_style"
-#  • application/json: { "image_b64": "...", "room_style": "..." }
-# Returns: image/jpeg on success, JSON error on failure
-
+# ─────────────────────────── HTTP Web Endpoint (ASGI /stage) ────────────────
 @app.function(
     image=image,
     timeout=900,
     retries=1,
     network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
     gpu=GPU_ARG,
-).web_endpoint("/stage", method="POST")
-async def stage_http(request: web.Request):
-    try:
-        # Optional API key check
-        if API_KEY:
-            key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
-            if key != API_KEY:
-                return Response(
-                    json.dumps({"error": "unauthorized", "message": "Invalid API key"}).encode(),
-                    content_type="application/json",
-                    status_code=401,
-                )
+)
+@asgi_app()
+def web_app():
+    api = FastAPI()
 
-        # Parse input
-        content_type = request.headers.get("content-type", "")
-        room_style = "modern luxury"
-        raw_bytes = None
-
-        if "multipart/form-data" in content_type:
-            form = await request.form()
-            uploaded = form.get("file")
-            if uploaded is None:
-                return Response(
-                    json.dumps({"error": "missing_file", "message": "Expected form field 'file'"}).encode(),
-                    content_type="application/json",
-                    status_code=400,
-                )
-            room_style = form.get("room_style") or room_style
-            raw_bytes = await uploaded.read()
-        else:
-            # JSON
-            payload = await request.json()
-            room_style = payload.get("room_style", room_style)
-            if payload.get("image_url"):
-                # Optional: fetch remote image URL server-side
-                try:
-                    import requests
-                    r = requests.get(payload["image_url"], timeout=10)
-                    r.raise_for_status()
-                    raw_bytes = r.content
-                except Exception as fe:
-                    return Response(
-                        json.dumps({"error": "fetch_failed", "message": str(fe)}).encode(),
-                        content_type="application/json",
-                        status_code=400,
-                    )
-            else:
-                image_b64 = payload.get("image_b64")
-                if not image_b64:
-                    return Response(
-                        json.dumps({
-                            "error": "missing_image",
-                            "message": "Provide 'image_b64' in JSON or send multipart with 'file'"
-                        }).encode(),
-                        content_type="application/json",
-                        status_code=400,
-                    )
-                raw_bytes = base64.b64decode(image_b64)
-
-        # Call GPU staging function
-        out = virtual_stage.remote(raw_bytes, room_style)
-
-        # If error payload (JSON), pass-through with 500
+    @api.post("/stage")
+    async def stage_http(request: Request):
         try:
-            maybe = json.loads(out.decode("utf-8"))
-            if isinstance(maybe, dict) and maybe.get("error"):
-                return Response(out, content_type="application/json", status_code=500)
-        except Exception:
-            pass
+            # Optional API key check
+            if API_KEY:
+                key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+                if key != API_KEY:
+                    return Response(
+                        content=json.dumps({"error": "unauthorized", "message": "Invalid API key"}),
+                        media_type="application/json",
+                        status_code=401,
+                    )
 
-        # Success: return JPEG
-        return Response(out, content_type="image/jpeg")
+            # Parse input
+            content_type = request.headers.get("content-type", "") or ""
+            room_style = "modern luxury"
+            raw_bytes = None
 
-    except Exception as e:
-        return Response(
-            json.dumps({"error": "stage_http_failed", "message": str(e)}).encode(),
-            content_type="application/json",
-            status_code=500,
-        )
+            if "multipart/form-data" in content_type:
+                form = await request.form()
+                uploaded = form.get("file")
+                if uploaded is None:
+                    return Response(
+                        content=json.dumps({"error": "missing_file", "message": "Expected form field 'file'"}),
+                        media_type="application/json",
+                        status_code=400,
+                    )
+                room_style = form.get("room_style") or room_style
+                raw_bytes = await uploaded.read()
+            else:
+                # JSON
+                payload = await request.json()
+                room_style = payload.get("room_style", room_style)
+                if payload.get("image_url"):
+                    try:
+                        import requests
+                        r = requests.get(payload["image_url"], timeout=10)
+                        r.raise_for_status()
+                        raw_bytes = r.content
+                    except Exception as fe:
+                        return Response(
+                            content=json.dumps({"error": "fetch_failed", "message": str(fe)}),
+                            media_type="application/json",
+                            status_code=400,
+                        )
+                else:
+                    image_b64 = payload.get("image_b64")
+                    if not image_b64:
+                        return Response(
+                            content=json.dumps({
+                                "error": "missing_image",
+                                "message": "Provide 'image_b64' in JSON or send multipart with 'file'"
+                            }),
+                            media_type="application/json",
+                            status_code=400,
+                        )
+                    raw_bytes = base64.b64decode(image_b64)
+
+            # Call GPU staging function
+            out = virtual_stage.remote(raw_bytes, room_style)
+
+            # If error payload (JSON), pass-through with 500
+            try:
+                maybe = json.loads(out.decode("utf-8"))
+                if isinstance(maybe, dict) and maybe.get("error"):
+                    return Response(content=out, media_type="application/json", status_code=500)
+            except Exception:
+                pass
+
+            # Success: return JPEG
+            return Response(content=out, media_type="image/jpeg")
+
+        except Exception as e:
+            return Response(
+                content=json.dumps({"error": "stage_http_failed", "message": str(e)}),
+                media_type="application/json",
+                status_code=500,
+            )
+
+    return api
 
 
 # ─────────────────────────── Local Entrypoints (CLI Helpers) ─────────────────
