@@ -19,6 +19,7 @@ permissions:
 env:
   PYTHON_VERSION: "3.11"
   MODAL_ENTRYPOINT: "modal/modal_app.py" # change if your entry file is elsewhere
+  MODAL_PROFILE: "prod"                  # single source of truth for profile
 
 jobs:
   deploy:
@@ -54,7 +55,7 @@ jobs:
           fi
           python -m modal --version >/dev/null
 
-      # --- Modal auth (non-interactive, no --profile flags) ---
+      # --- Modal auth (writes to named profile, then verifies) ---
       - name: Configure Modal token
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
@@ -64,13 +65,26 @@ jobs:
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
           fi
+
+          # Write creds into the prod profile
           python -m modal token set \
             --token-id "$MODAL_TOKEN_ID" \
-            --token-secret "$MODAL_TOKEN_SECRET"
-          echo "MODAL_PROFILE=prod" >> $GITHUB_ENV
+            --token-secret "$MODAL_TOKEN_SECRET" \
+            --profile "${MODAL_PROFILE}"
+
+          # Verify we can read them back (does not print secrets)
+          python -m modal token get --profile "${MODAL_PROFILE}" >/dev/null 2>&1 || {
+            echo "::error::Failed to read back Modal token for profile '${MODAL_PROFILE}'"
+            exit 1
+          }
+
+          # Make profile visible to subsequent steps
+          echo "MODAL_PROFILE=${MODAL_PROFILE}" >> "$GITHUB_ENV"
+
+          # Clear from env
           unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET
 
-      - name: Validate entrypoint
+      - name: Validate entrypoint exists
         run: |
           if [ ! -f "$MODAL_ENTRYPOINT" ]; then
             echo "::error file=$MODAL_ENTRYPOINT::Modal entrypoint not found"
@@ -83,17 +97,23 @@ jobs:
           MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
           MODAL_ENTRYPOINT: ${{ env.MODAL_ENTRYPOINT }}
         run: |
+          set -e
+          echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
+          echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
+
           n=0
           until [ $n -ge 3 ]; do
-            python -m modal deploy "$MODAL_ENTRYPOINT" && break
+            if python -m modal deploy "${MODAL_ENTRYPOINT}" --profile "${MODAL_PROFILE}"; then
+              echo "Deploy succeeded."
+              exit 0
+            fi
             n=$((n+1))
-            echo "Deploy failed (attempt $n). Retrying in 10s..."
+            echo "Deploy failed (attempt ${n}). Retrying in 10s..."
             sleep 10
           done
-          if [ $n -ge 3 ]; then
-            echo "::error::Modal deploy failed after 3 attempts."
-            exit 1
-          fi
+
+          echo "::error::Modal deploy failed after 3 attempts."
+          exit 1
 
       # ================= Alerts on failure (email + SMS) =================
       - name: Send failure email (Resend)
