@@ -7,7 +7,7 @@ import base64
 import io
 import os
 import json
-from typing import Optional, Tuple
+from typing import Optional
 
 import modal
 
@@ -29,25 +29,23 @@ DEFAULT_STEPS = int(os.getenv("STEPS", "28"))
 MAX_EDGE = int(os.getenv("MAX_EDGE", "1536"))
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "92"))
 
-GPU_TYPE = os.getenv("GPU_TYPE", "A10G").upper()
-if GPU_TYPE not in {"A10G", "A100", "H100", "CPU"}:
-    GPU_TYPE = "A10G"
+# GPU strings per new Modal guidance
+# Valid examples: "CPU" (None), "A10G", "A100-40GB", "H100"
+GPU_TYPE = (os.getenv("GPU_TYPE", "A10G") or "A10G").upper()
+if GPU_TYPE not in {"A10G", "A100-40GB", "H100", "CPU"}:
+    # accept old "A100" to keep compatibility
+    if GPU_TYPE == "A100":
+        GPU_TYPE = "A100-40GB"
+    else:
+        GPU_TYPE = "A10G"
 
-# Map to Modal GPU objects (or None for CPU)
-from modal import gpu as modal_gpu
-_GPU_MAP = {
-    "A10G": modal_gpu.A10G(),
-    "A100": modal_gpu.A100(),
-    "H100": modal_gpu.H100(),
-}
-GPU_ARG = _GPU_MAP.get(GPU_TYPE)  # None if CPU
+GPU_ARG = None if GPU_TYPE == "CPU" else GPU_TYPE  # strings now, not objects
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App + NFS + Image
 # ──────────────────────────────────────────────────────────────────────────────
 app = modal.App(APP_NAME)
 
-# Correct NFS API & mapping (NFS -> mount path)
 HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
 
 image = (
@@ -97,7 +95,6 @@ def _canny(image_pil):
     from PIL import Image
     img = np.array(image_pil.convert("RGB"))
     edges = cv2.Canny(img, 100, 200)
-    # replicate to 3 channels so ControlNet sees an RGB-like image
     return Image.fromarray(np.stack([edges] * 3, axis=-1))
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -140,7 +137,7 @@ def _load_pipeline():
         pass
     try:
         if use_cuda:
-            pipe.enable_model_cpu_offload()  # better balance for large models
+            pipe.enable_model_cpu_offload()
         else:
             pipe.enable_sequential_cpu_offload()
     except Exception:
@@ -159,11 +156,12 @@ def _load_pipeline():
 # Core worker
 # ──────────────────────────────────────────────────────────────────────────────
 @app.function(
-    name="virtual_stage",  # callable by other functions
+    name="virtual_stage",
+    serialized=True,  # ← required when setting a custom name
     image=image,
     timeout=900,
-    gpu=GPU_ARG,
-    network_file_systems={HF_CACHE: HF_CACHE_MOUNT},
+    gpu=GPU_ARG,  # strings or None
+    network_file_systems={HF_CACHE: HF_CACHE_MOUNT},  # NFS → mount path
 )
 def virtual_stage(
     image_bytes: bytes,
@@ -179,7 +177,7 @@ def virtual_stage(
     g = float(guidance_scale or DEFAULT_GUIDANCE)
     steps = int(num_inference_steps or DEFAULT_STEPS)
 
-    pipe, device_desc = _load_pipeline()
+    pipe, _device_desc = _load_pipeline()
 
     inp = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     inp = _resize_long_edge(inp, MAX_EDGE)
@@ -192,7 +190,6 @@ def virtual_stage(
         except Exception:
             generator = torch.Generator().manual_seed(int(seed))
 
-    # Run
     with torch.inference_mode():
         result = pipe(
             image=control,
@@ -206,11 +203,11 @@ def virtual_stage(
     return _to_jpeg_bytes(result.images[0], JPEG_QUALITY)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Web endpoint
-# NOTE: Path is derived from function name="stage".
+# Web endpoint → POST /stage
 # ──────────────────────────────────────────────────────────────────────────────
 @app.function(
-    name="stage",  # ⇦ yields POST /stage
+    name="stage",           # path is derived from name
+    serialized=True,        # ← required with custom name
     image=image,
     timeout=900,
     gpu=GPU_ARG,
@@ -219,19 +216,14 @@ def virtual_stage(
 @modal.web_endpoint(method="POST")
 async def stage(request: modal.web.Request):
     """
-    POST /stage
-
-    Content-Types supported:
+    Content-Types:
     - application/json
-        { "image_b64": "...", "room_style": "modern luxury", "seed": 123, "guidance_scale": 5.0, "num_inference_steps": 28 }
-        or
-        { "image_url": "https://..." , ... }
-
+      { "image_b64": "...", "room_style": "modern luxury", "seed": 123, "guidance_scale": 5.0, "num_inference_steps": 28 }
+      or { "image_url": "https://..." , ... }
     - multipart/form-data
-        fields: file=<binary>, room_style=?, seed=?, guidance_scale=?, num_inference_steps=?
+      fields: file=<binary>, room_style=?, seed=?, guidance_scale=?, num_inference_steps=?
     """
     try:
-        # Simple API key gate (optional)
         if API_KEY and request.headers.get("x-api-key") != API_KEY:
             return modal.web.Response.json({"error": "unauthorized"}, status=401)
 
@@ -244,8 +236,6 @@ async def stage(request: modal.web.Request):
         raw_bytes: Optional[bytes] = None
 
         if content_type.startswith("multipart/"):
-            # Modal Request supports .form() in recent versions; if not available,
-            # fall back to raw body parsing on your side.
             form = await request.form()
             uploaded = form.get("file")
             if not uploaded:
@@ -253,25 +243,17 @@ async def stage(request: modal.web.Request):
 
             room_style = form.get("room_style") or room_style
             if form.get("seed") is not None:
-                try:
-                    seed = int(form.get("seed"))
-                except Exception:
-                    pass
+                try: seed = int(form.get("seed"))
+                except Exception: pass
             if form.get("guidance_scale") is not None:
-                try:
-                    guidance_scale = float(form.get("guidance_scale"))
-                except Exception:
-                    pass
+                try: guidance_scale = float(form.get("guidance_scale"))
+                except Exception: pass
             if form.get("num_inference_steps") is not None:
-                try:
-                    num_inference_steps = int(form.get("num_inference_steps"))
-                except Exception:
-                    pass
+                try: num_inference_steps = int(form.get("num_inference_steps"))
+                except Exception: pass
 
             raw_bytes = await uploaded.read()
-
         else:
-            # Expect JSON
             payload = await request.json()
             room_style = payload.get("room_style", room_style)
             seed = payload.get("seed")
@@ -280,7 +262,6 @@ async def stage(request: modal.web.Request):
 
             if payload.get("image_url"):
                 import requests
-
                 r = requests.get(payload["image_url"], timeout=15)
                 r.raise_for_status()
                 raw_bytes = r.content
@@ -290,7 +271,6 @@ async def stage(request: modal.web.Request):
                     return modal.web.Response.json({"error": "missing_image"}, status=400)
                 raw_bytes = base64.b64decode(image_b64)
 
-        # Call the GPU worker
         jpeg_bytes: bytes = virtual_stage.remote(
             raw_bytes,
             room_style=room_style,
@@ -299,11 +279,9 @@ async def stage(request: modal.web.Request):
             num_inference_steps=num_inference_steps,
         )
 
-        # Return as an image
         return modal.web.Response(jpeg_bytes, content_type="image/jpeg")
 
     except Exception as e:
-        # Structured error
         return modal.web.Response.json({"error": str(e)}, status=500)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -311,5 +289,6 @@ async def stage(request: modal.web.Request):
 # ──────────────────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
 def main():
-    print("Serve locally for dev:\n  modal serve modal/modal_app.py")
-    print("Deployed endpoint path will be POST /stage")
+    print("Dev server:\n  modal serve modal/modal_app.py")
+    print("Deploy:\n  modal deploy modal/modal_app.py")
+    print("Endpoint: POST /stage")
