@@ -403,4 +403,3 @@ async def warm(_request):  # type: ignore[no-untyped-def]
         return JSONResponse({"ok": True, "warmed": True}, status_code=200)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
