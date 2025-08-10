@@ -68,7 +68,6 @@ image = (
         "opencv-python-headless==4.10.0.84",
         "numpy==2.0.1",
         "requests>=2.32.3",
-    
         "fastapi==0.111.0",
         "python-multipart==0.0.9",
     )
@@ -217,12 +216,13 @@ def _load_pipeline():
 # ──────────────────────────────────────────────────────────────────────────────
 # Core worker
 # ──────────────────────────────────────────────────────────────────────────────
-@app.function(name=\"virtual_stage\", serialized=True,
+@app.function(
+    name="virtual_stage",
     serialized=True,
     image=image,
     timeout=900,
     gpu=GPU_ARG,
-    min_containers=1,              # ← Modal 1.0 rename (was keep_warm)
+    min_containers=1,              # Modal 1.0 rename (was keep_warm)
     network_file_systems=NFS_MOUNTS,
 )
 def virtual_stage(
@@ -274,20 +274,21 @@ def virtual_stage(
 # ──────────────────────────────────────────────────────────────────────────────
 # Web endpoints
 # ──────────────────────────────────────────────────────────────────────────────
-def _auth(request: modal.web.Request):
+def _auth(request: Request):
     if API_KEY and request.headers.get("x-api-key") != API_KEY:
         return {"ok": False, "status": 401, "err": "unauthorized"}
     return {"ok": True}
 
-@app.function(name=\"stage\", serialized=True,
+@app.function(
+    name="stage",
     serialized=True,
     image=image,
     timeout=900,
     gpu=GPU_ARG,
-    min_containers=1,              # ← rename
+    min_containers=1,
     network_file_systems=NFS_MOUNTS,
 )
-@modal.fastapi_endpoint(method="POST")   # ← rename from web_endpoint
+@modal.fastapi_endpoint(method="POST")
 async def stage(request: Request):
     """
     POST /stage
@@ -296,7 +297,7 @@ async def stage(request: Request):
     """
     a = _auth(request)
     if not a["ok"]:
-        return JSONResponse({"error": a["err"]}, status= a["status"])
+        return JSONResponse({"error": a["err"]}, status_code=a["status"])
 
     try:
         content_type = (request.headers.get("content-type") or "").lower()
@@ -310,7 +311,7 @@ async def stage(request: Request):
             form = await request.form()
             uploaded = form.get("file")
             if not uploaded:
-                return JSONResponse({"error": "missing_file"}, status=400)
+                return JSONResponse({"error": "missing_file"}, status_code=400)
 
             room_style = _validate_room_style(form.get("room_style"))
             if form.get("seed") is not None:
@@ -338,13 +339,13 @@ async def stage(request: Request):
             else:
                 image_b64 = payload.get("image_b64")
                 if not image_b64:
-                    return JSONResponse({"error": "missing_image"}, status=400)
+                    return JSONResponse({"error": "missing_image"}, status_code=400)
                 raw_bytes = _parse_b64(image_b64)
 
         if not raw_bytes:
-            return JSONResponse({"error": "empty_image_bytes"}, status=400)
+            return JSONResponse({"error": "empty_image_bytes"}, status_code=400)
         if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-            return JSONResponse({"error": "image_too_large"}, status=413)
+            return JSONResponse({"error": "image_too_large"}, status_code=413)
 
         jpeg_bytes: bytes = virtual_stage.remote(
             raw_bytes,
@@ -353,43 +354,45 @@ async def stage(request: Request):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
         )
-        return Response(jpeg_bytes, content_type="image/jpeg")
+        return Response(content=jpeg_bytes, media_type="image/jpeg")
 
     except ValueError as ve:
-        return JSONResponse({"error": str(ve)}, status=400)
+        return JSONResponse({"error": str(ve)}, status_code=400)
     except Exception as e:
-        return JSONResponse({"error": "internal_error", "detail": str(e)}, status=500)
+        return JSONResponse({"error": "internal_error", "detail": str(e)}, status_code=500)
 
-@app.function(name=\"health\", serialized=True,
+@app.function(
+    name="health",
     serialized=True,
     image=image,
-    min_containers=1,              # ← rename
+    min_containers=1,
     network_file_systems=NFS_MOUNTS,
 )
-@modal.fastapi_endpoint(method="GET")    # ← rename
+@modal.fastapi_endpoint(method="GET")
 async def health(_request: Request):
     try:
         return JSONResponse(
             {"ok": True, "app": APP_NAME, "version": VERSION, "gpu": GPU_TYPE, "hf_cache_mount": HF_CACHE_MOUNT},
-            status=200,
+            status_code=200,
         )
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status=500)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
-@app.function(name=\"warm\", serialized=True,
+@app.function(
+    name="warm",
     serialized=True,
     image=image,
     gpu=GPU_ARG,
-    min_containers=1,              # ← rename
+    min_containers=1,
     network_file_systems=NFS_MOUNTS,
 )
-@modal.fastapi_endpoint(method="POST")   # ← rename
+@modal.fastapi_endpoint(method="POST")
 async def warm(_request: Request):
     try:
         _load_pipeline()
-        return JSONResponse({"ok": True, "warmed": True}, status=200)
+        return JSONResponse({"ok": True, "warmed": True}, status_code=200)
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status=500)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Local entry
