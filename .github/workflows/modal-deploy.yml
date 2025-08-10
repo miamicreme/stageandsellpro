@@ -46,7 +46,9 @@ jobs:
             pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
 
       - name: Install Modal CLI (runner-only)
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements-ci.txt ]; then
             pip install -r requirements-ci.txt
@@ -57,11 +59,15 @@ jobs:
 
       # --- Modal auth (writes to named profile, then verifies) ---
       - name: Configure Modal token
+        shell: bash
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_PROFILE: prod
         run: |
-          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+          set -euo pipefail
+
+          if [ -z "${MODAL_TOKEN_ID:-}" ] || [ -z "${MODAL_TOKEN_SECRET:-}" ]; then
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
           fi
@@ -70,22 +76,24 @@ jobs:
           python -m modal token set \
             --token-id "$MODAL_TOKEN_ID" \
             --token-secret "$MODAL_TOKEN_SECRET" \
-            --profile "${MODAL_PROFILE}"
+            --profile "$MODAL_PROFILE"
 
-          # Verify we can read them back (does not print secrets)
-          python -m modal token get --profile "${MODAL_PROFILE}" >/dev/null 2>&1 || {
-            echo "::error::Failed to read back Modal token for profile '${MODAL_PROFILE}'"
+          # IMPORTANT: clear env so they don't override the profile file
+          unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET
+
+          # Verify we can read them back from the saved profile (no env present now)
+          python -m modal token get --profile "$MODAL_PROFILE" >/dev/null 2>&1 || {
+            echo "::error::Failed to read back Modal token for profile '$MODAL_PROFILE'"
             exit 1
           }
 
           # Make profile visible to subsequent steps
-          echo "MODAL_PROFILE=${MODAL_PROFILE}" >> "$GITHUB_ENV"
-
-          # Clear from env
-          unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET
+          echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
 
       - name: Validate entrypoint exists
+        shell: bash
         run: |
+          set -euo pipefail
           if [ ! -f "$MODAL_ENTRYPOINT" ]; then
             echo "::error file=$MODAL_ENTRYPOINT::Modal entrypoint not found"
             exit 1
@@ -93,22 +101,21 @@ jobs:
 
       # --- Deploy (with retry) ---
       - name: Deploy to Modal
+        shell: bash
         env:
           MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
           MODAL_ENTRYPOINT: ${{ env.MODAL_ENTRYPOINT }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
           echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
 
-          n=0
-          until [ $n -ge 3 ]; do
+          for attempt in 1 2 3; do
             if python -m modal deploy "${MODAL_ENTRYPOINT}" --profile "${MODAL_PROFILE}"; then
               echo "Deploy succeeded."
               exit 0
             fi
-            n=$((n+1))
-            echo "Deploy failed (attempt ${n}). Retrying in 10s..."
+            echo "Deploy failed (attempt ${attempt}). Retrying in 10s..."
             sleep 10
           done
 
@@ -118,11 +125,13 @@ jobs:
       # ================= Alerts on failure (email + SMS) =================
       - name: Send failure email (Resend)
         if: failure() && env.RESEND_API_KEY != '' && env.ALERT_EMAIL_FROM != '' && env.ALERT_EMAIL_TO != ''
+        shell: bash
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: |
+          set -euo pipefail
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           BODY=$(cat <<EOF
           {
@@ -140,12 +149,14 @@ jobs:
 
       - name: Send failure SMS (Twilio)
         if: failure() && env.TWILIO_ACCOUNT_SID != '' && env.TWILIO_AUTH_TOKEN != '' && env.TWILIO_FROM != '' && env.ALERT_SMS_TO != ''
+        shell: bash
         env:
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
           TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
           ALERT_SMS_TO: ${{ secrets.ALERT_SMS_TO }}
         run: |
+          set -euo pipefail
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           MSG="❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME} (${GITHUB_SHA::7}) ${RUN_URL}"
           curl -s -X POST "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json" \
