@@ -7,39 +7,43 @@ import base64
 import io
 import os
 import json
-from typing import Optional
+import re
+from typing import Optional, Tuple
 
 import modal
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config
+# Config (env tunables with safe defaults)
 # ──────────────────────────────────────────────────────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
+VERSION = os.getenv("VERSION", "2025-08-09")
 
-HF_CACHE_NAME = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
+HF_CACHE_NAME  = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
 HF_CACHE_MOUNT = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
 
 API_KEY = os.getenv("API_KEY", "")
 
-SDXL_BASE = os.getenv("SDXL_BASE", "stabilityai/stable-diffusion-xl-base-1.0")
+SDXL_BASE        = os.getenv("SDXL_BASE", "stabilityai/stable-diffusion-xl-base-1.0")
 CONTROLNET_MODEL = os.getenv("CONTROLNET_MODEL", "diffusers/controlnet-canny-sdxl-1.0")
 
 DEFAULT_GUIDANCE = float(os.getenv("GUIDANCE", "5.0"))
-DEFAULT_STEPS = int(os.getenv("STEPS", "28"))
-MAX_EDGE = int(os.getenv("MAX_EDGE", "1536"))
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "92"))
+DEFAULT_STEPS    = int(os.getenv("STEPS", "28"))
+MAX_EDGE         = int(os.getenv("MAX_EDGE", "1536"))
+JPEG_QUALITY     = int(os.getenv("JPEG_QUALITY", "92"))
 
-# GPU strings per new Modal guidance
-# Valid examples: "CPU" (None), "A10G", "A100-40GB", "H100"
+MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "20"))      # hard cap on incoming image size
+REQUEST_TIMEOUTS = (5, 20)  # (connect, read) seconds
+
+# GPU strings per new Modal guidance: "CPU" (None), "A10G", "A100-40GB", "H100"
 GPU_TYPE = (os.getenv("GPU_TYPE", "A10G") or "A10G").upper()
 if GPU_TYPE not in {"A10G", "A100-40GB", "H100", "CPU"}:
-    # accept old "A100" to keep compatibility
-    if GPU_TYPE == "A100":
-        GPU_TYPE = "A100-40GB"
-    else:
-        GPU_TYPE = "A10G"
-
+    GPU_TYPE = "A100-40GB" if GPU_TYPE == "A100" else "A10G"
 GPU_ARG = None if GPU_TYPE == "CPU" else GPU_TYPE  # strings now, not objects
+
+# Safe ranges
+MIN_STEPS, MAX_STEPS = 5, 50
+MIN_GUIDE, MAX_GUIDE = 1.0, 12.0
+MAX_ROOM_STYLE_LEN   = 200
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App + NFS + Image
@@ -47,6 +51,7 @@ GPU_ARG = None if GPU_TYPE == "CPU" else GPU_TYPE  # strings now, not objects
 app = modal.App(APP_NAME)
 
 HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
+NFS_MOUNTS = {HF_CACHE_MOUNT: HF_CACHE}  # mount_path -> NFS (correct direction)
 
 image = (
     modal.Image.debian_slim()
@@ -97,10 +102,81 @@ def _canny(image_pil):
     edges = cv2.Canny(img, 100, 200)
     return Image.fromarray(np.stack([edges] * 3, axis=-1))
 
+def _parse_b64(data: str) -> bytes:
+    # Supports data URLs like "data:image/jpeg;base64,AAAA"
+    if data.startswith("data:"):
+        m = re.match(r"data:[^;]+;base64,(.*)$", data, flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise ValueError("invalid_data_url")
+        data = m.group(1)
+    try:
+        return base64.b64decode(data, validate=True)
+    except Exception:
+        # try forgiving decode
+        return base64.b64decode(data)
+
+def _fetch_image_from_url(url: str, max_mb: int) -> bytes:
+    from urllib.parse import urlparse
+    import requests
+
+    u = urlparse(url)
+    if u.scheme not in {"http", "https"}:
+        raise ValueError("unsupported_url_scheme")
+
+    headers = {"User-Agent": f"StageSellPro/{VERSION}"}
+    with requests.get(url, headers=headers, timeout=REQUEST_TIMEOUTS, stream=True) as r:
+        r.raise_for_status()
+
+        # Content-Type guard (best-effort)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "image" not in ctype and not ctype.startswith("application/octet-stream"):
+            raise ValueError("not_an_image_response")
+
+        # Enforce size cap (via header or streaming)
+        max_bytes = max_mb * 1024 * 1024
+        clen = r.headers.get("Content-Length")
+        if clen and int(clen) > max_bytes:
+            raise ValueError("image_too_large")
+
+        buf = io.BytesIO()
+        read = 0
+        for chunk in r.iter_content(chunk_size=1024 * 128):
+            if not chunk:
+                continue
+            read += len(chunk)
+            if read > max_bytes:
+                raise ValueError("image_too_large")
+            buf.write(chunk)
+        return buf.getvalue()
+
+def _validate_room_style(s: Optional[str]) -> str:
+    s = (s or "modern luxury").strip()
+    if len(s) > MAX_ROOM_STYLE_LEN:
+        s = s[:MAX_ROOM_STYLE_LEN]
+    return s
+
+def _clamp_steps(val: Optional[int]) -> int:
+    if val is None:
+        return DEFAULT_STEPS
+    try:
+        v = int(val)
+    except Exception:
+        v = DEFAULT_STEPS
+    return max(MIN_STEPS, min(MAX_STEPS, v))
+
+def _clamp_guidance(val: Optional[float]) -> float:
+    if val is None:
+        return DEFAULT_GUIDANCE
+    try:
+        v = float(val)
+    except Exception:
+        v = DEFAULT_GUIDANCE
+    return max(MIN_GUIDE, min(MAX_GUIDE, v))
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline Loader (cached)
+# Pipeline Loader (cached per worker)
 # ──────────────────────────────────────────────────────────────────────────────
-_pipeline = None  # cached in worker
+_pipeline = None
 
 def _load_pipeline():
     """
@@ -117,31 +193,20 @@ def _load_pipeline():
     dtype = torch.float16 if use_cuda else torch.float32
 
     controlnet = ControlNetModel.from_pretrained(
-        CONTROLNET_MODEL,
-        torch_dtype=dtype,
-        use_safetensors=True,
-        cache_dir=HF_CACHE_MOUNT,
+        CONTROLNET_MODEL, torch_dtype=dtype, use_safetensors=True, cache_dir=HF_CACHE_MOUNT
     )
     pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-        SDXL_BASE,
-        controlnet=controlnet,
-        torch_dtype=dtype,
-        use_safetensors=True,
-        cache_dir=HF_CACHE_MOUNT,
+        SDXL_BASE, controlnet=controlnet, torch_dtype=dtype, use_safetensors=True, cache_dir=HF_CACHE_MOUNT
     )
 
-    # Memory tweaks
-    try:
-        pipe.enable_vae_slicing()
-    except Exception:
-        pass
+    try: pipe.enable_vae_slicing()
+    except Exception: pass
     try:
         if use_cuda:
             pipe.enable_model_cpu_offload()
         else:
             pipe.enable_sequential_cpu_offload()
-    except Exception:
-        pass
+    except Exception: pass
 
     device_desc = "cpu"
     if use_cuda:
@@ -157,11 +222,12 @@ def _load_pipeline():
 # ──────────────────────────────────────────────────────────────────────────────
 @app.function(
     name="virtual_stage",
-    serialized=True,  # ← required when setting a custom name
+    serialized=True,
     image=image,
     timeout=900,
-    gpu=GPU_ARG,  # strings or None
-    network_file_systems={HF_CACHE: HF_CACHE_MOUNT},  # NFS → mount path
+    gpu=GPU_ARG,
+    keep_warm=1,                    # keep 1 warm worker for low-latency prod
+    network_file_systems=NFS_MOUNTS,
 )
 def virtual_stage(
     image_bytes: bytes,
@@ -171,29 +237,36 @@ def virtual_stage(
     guidance_scale: Optional[float] = None,
     num_inference_steps: Optional[int] = None,
 ) -> bytes:
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
     import torch
 
-    g = float(guidance_scale or DEFAULT_GUIDANCE)
-    steps = int(num_inference_steps or DEFAULT_STEPS)
+    g     = _clamp_guidance(guidance_scale)
+    steps = _clamp_steps(num_inference_steps)
 
     pipe, _device_desc = _load_pipeline()
 
-    inp = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        inp = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except UnidentifiedImageError:
+        raise ValueError("invalid_image_bytes")
+
     inp = _resize_long_edge(inp, MAX_EDGE)
     control = _canny(inp)
+
+    use_cuda = torch.cuda.is_available() and (GPU_ARG is not None)
+    gen_device = "cuda" if use_cuda else "cpu"
 
     generator = None
     if seed is not None:
         try:
-            generator = torch.Generator(device="cuda").manual_seed(int(seed))
+            generator = torch.Generator(device=gen_device).manual_seed(int(seed))
         except Exception:
             generator = torch.Generator().manual_seed(int(seed))
 
     with torch.inference_mode():
         result = pipe(
             image=control,
-            prompt=f"{room_style}, photorealistic, high quality, interior design",
+            prompt=f"{_validate_room_style(room_style)}, photorealistic, high quality, interior design",
             negative_prompt=negative_prompt,
             generator=generator,
             guidance_scale=g,
@@ -203,32 +276,36 @@ def virtual_stage(
     return _to_jpeg_bytes(result.images[0], JPEG_QUALITY)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Web endpoint → POST /stage
+# Web endpoints
 # ──────────────────────────────────────────────────────────────────────────────
+def _auth(request: modal.web.Request):
+    if API_KEY and request.headers.get("x-api-key") != API_KEY:
+        return {"ok": False, "status": 401, "err": "unauthorized"}
+    return {"ok": True}
+
 @app.function(
-    name="stage",           # path is derived from name
-    serialized=True,        # ← required with custom name
+    name="stage",
+    serialized=True,
     image=image,
     timeout=900,
     gpu=GPU_ARG,
-    network_file_systems={HF_CACHE: HF_CACHE_MOUNT},
+    keep_warm=1,
+    network_file_systems=NFS_MOUNTS,
 )
 @modal.web_endpoint(method="POST")
 async def stage(request: modal.web.Request):
     """
-    Content-Types:
-    - application/json
-      { "image_b64": "...", "room_style": "modern luxury", "seed": 123, "guidance_scale": 5.0, "num_inference_steps": 28 }
-      or { "image_url": "https://..." , ... }
-    - multipart/form-data
-      fields: file=<binary>, room_style=?, seed=?, guidance_scale=?, num_inference_steps=?
+    POST /stage
+    - application/json: { image_b64 | image_url, room_style?, seed?, guidance_scale?, num_inference_steps? }
+    - multipart/form-data: file=<binary>, room_style?, seed?, guidance_scale?, num_inference_steps?
     """
+    # Auth
+    a = _auth(request)
+    if not a["ok"]:
+        return modal.web.Response.json({"error": a["err"]}, status=a["status"])
+
     try:
-        if API_KEY and request.headers.get("x-api-key") != API_KEY:
-            return modal.web.Response.json({"error": "unauthorized"}, status=401)
-
         content_type = (request.headers.get("content-type") or "").lower()
-
         room_style = "modern luxury"
         seed = None
         guidance_scale = None
@@ -241,7 +318,7 @@ async def stage(request: modal.web.Request):
             if not uploaded:
                 return modal.web.Response.json({"error": "missing_file"}, status=400)
 
-            room_style = form.get("room_style") or room_style
+            room_style = _validate_room_style(form.get("room_style"))
             if form.get("seed") is not None:
                 try: seed = int(form.get("seed"))
                 except Exception: pass
@@ -253,23 +330,27 @@ async def stage(request: modal.web.Request):
                 except Exception: pass
 
             raw_bytes = await uploaded.read()
+
         else:
             payload = await request.json()
-            room_style = payload.get("room_style", room_style)
+            room_style = _validate_room_style(payload.get("room_style"))
+
             seed = payload.get("seed")
             guidance_scale = payload.get("guidance_scale")
             num_inference_steps = payload.get("num_inference_steps")
 
             if payload.get("image_url"):
-                import requests
-                r = requests.get(payload["image_url"], timeout=15)
-                r.raise_for_status()
-                raw_bytes = r.content
+                raw_bytes = _fetch_image_from_url(payload["image_url"], MAX_UPLOAD_MB)
             else:
                 image_b64 = payload.get("image_b64")
                 if not image_b64:
                     return modal.web.Response.json({"error": "missing_image"}, status=400)
-                raw_bytes = base64.b64decode(image_b64)
+                raw_bytes = _parse_b64(image_b64)
+
+        if not raw_bytes:
+            return modal.web.Response.json({"error": "empty_image_bytes"}, status=400)
+        if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+            return modal.web.Response.json({"error": "image_too_large"}, status=413)
 
         jpeg_bytes: bytes = virtual_stage.remote(
             raw_bytes,
@@ -278,17 +359,47 @@ async def stage(request: modal.web.Request):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
         )
-
         return modal.web.Response(jpeg_bytes, content_type="image/jpeg")
 
+    except ValueError as ve:
+        # Known/validated errors
+        return modal.web.Response.json({"error": str(ve)}, status=400)
     except Exception as e:
-        return modal.web.Response.json({"error": str(e)}, status=500)
+        # Unknown error
+        return modal.web.Response.json({"error": "internal_error", "detail": str(e)}, status=500)
+
+@app.function(name="health", serialized=True, image=image, network_file_systems=NFS_MOUNTS, keep_warm=1)
+@modal.web_endpoint(method="GET")
+async def health(_request: modal.web.Request):
+    try:
+        # Fast checks only; model load is done in /warm
+        return modal.web.Response.json(
+            {
+                "ok": True,
+                "app": APP_NAME,
+                "version": VERSION,
+                "gpu": GPU_TYPE,
+                "hf_cache_mount": HF_CACHE_MOUNT,
+            },
+            status=200,
+        )
+    except Exception as e:
+        return modal.web.Response.json({"ok": False, "error": str(e)}, status=500)
+
+@app.function(name="warm", serialized=True, image=image, gpu=GPU_ARG, keep_warm=1, network_file_systems=NFS_MOUNTS)
+@modal.web_endpoint(method="POST")
+async def warm(_request: modal.web.Request):
+    try:
+        _load_pipeline()
+        return modal.web.Response.json({"ok": True, "warmed": True}, status=200)
+    except Exception as e:
+        return modal.web.Response.json({"ok": False, "error": str(e)}, status=500)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Local entry
 # ──────────────────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
 def main():
-    print("Dev server:\n  modal serve modal/modal_app.py")
+    print("Dev:\n  modal serve modal/modal_app.py")
     print("Deploy:\n  modal deploy modal/modal_app.py")
-    print("Endpoint: POST /stage")
+    print("Endpoints:\n  GET  /health\n  POST /warm\n  POST /stage")
