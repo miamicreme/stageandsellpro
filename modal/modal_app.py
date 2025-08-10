@@ -1,6 +1,6 @@
 # modal_app.py
 # Stage & Sell Pro — SDXL + ControlNet virtual staging pipeline on Modal
-# (ASGI web endpoint, no FastAPI dependency)
+# (ASGI web endpoint; defer FastAPI imports so the runner doesn't need FastAPI)
 
 from __future__ import annotations
 import base64
@@ -8,11 +8,13 @@ import io
 import os
 import json
 import re
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import modal
-from fastapi import Request, Response
-from fastapi.responses import JSONResponse
+if TYPE_CHECKING:
+    # Editor/type-checker only; not imported at runtime on the runner
+    from fastapi import Request, Response
+    from fastapi.responses import JSONResponse
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config (env tunables with safe defaults)
@@ -68,6 +70,7 @@ image = (
         "opencv-python-headless==4.10.0.84",
         "numpy==2.0.1",
         "requests>=2.32.3",
+        # Needed by @modal.fastapi_endpoint (installed in the image, not on the runner)
         "fastapi==0.111.0",
         "python-multipart==0.0.9",
     )
@@ -274,7 +277,7 @@ def virtual_stage(
 # ──────────────────────────────────────────────────────────────────────────────
 # Web endpoints
 # ──────────────────────────────────────────────────────────────────────────────
-def _auth(request: Request):
+def _auth(request):  # avoid importing FastAPI types at module import time
     if API_KEY and request.headers.get("x-api-key") != API_KEY:
         return {"ok": False, "status": 401, "err": "unauthorized"}
     return {"ok": True}
@@ -289,7 +292,10 @@ def _auth(request: Request):
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")
-async def stage(request: Request):
+async def stage(request):  # type: ignore[no-untyped-def]
+    from fastapi import Response
+    from fastapi.responses import JSONResponse
+
     """
     POST /stage
     - application/json: { image_b64 | image_url, room_style?, seed?, guidance_scale?, num_inference_steps? }
@@ -369,7 +375,9 @@ async def stage(request: Request):
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="GET")
-async def health(_request: Request):
+async def health(_request):  # type: ignore[no-untyped-def]
+    from fastapi.responses import JSONResponse
+
     try:
         return JSONResponse(
             {"ok": True, "app": APP_NAME, "version": VERSION, "gpu": GPU_TYPE, "hf_cache_mount": HF_CACHE_MOUNT},
@@ -387,7 +395,9 @@ async def health(_request: Request):
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")
-async def warm(_request: Request):
+async def warm(_request):  # type: ignore[no-untyped-def]
+    from fastapi.responses import JSONResponse
+
     try:
         _load_pipeline()
         return JSONResponse({"ok": True, "warmed": True}, status_code=200)
