@@ -61,31 +61,30 @@ jobs:
       - name: Configure Modal token
         shell: bash
         env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          # NOTE: Use CI_ names so Modal CLI won't auto-read them from env
+          CI_MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          CI_MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           MODAL_PROFILE: prod
         run: |
           set -euo pipefail
 
-          if [ -z "${MODAL_TOKEN_ID:-}" ] || [ -z "${MODAL_TOKEN_SECRET:-}" ]; then
+          if [ -z "${CI_MODAL_TOKEN_ID:-}" ] || [ -z "${CI_MODAL_TOKEN_SECRET:-}" ]; then
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
           fi
 
-          # Write creds into the prod profile
+          # Write creds into the prod profile (no MODAL_* env exported)
           python -m modal token set \
-            --token-id "$MODAL_TOKEN_ID" \
-            --token-secret "$MODAL_TOKEN_SECRET" \
+            --token-id "$CI_MODAL_TOKEN_ID" \
+            --token-secret "$CI_MODAL_TOKEN_SECRET" \
             --profile "$MODAL_PROFILE"
 
-          # IMPORTANT: clear env so they don't override the profile file
-          unset MODAL_TOKEN_ID MODAL_TOKEN_SECRET
-
-          # Verify we can read them back from the saved profile (no env present now)
-          python -m modal token get --profile "$MODAL_PROFILE" >/dev/null 2>&1 || {
-            echo "::error::Failed to read back Modal token for profile '$MODAL_PROFILE'"
-            exit 1
-          }
+          # Verify strictly from the saved profile (explicitly remove any accidental MODAL_* env)
+          env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
+            python -m modal token get --profile "$MODAL_PROFILE" >/dev/null 2>&1 || {
+              echo "::error::Failed to read back Modal token for profile '$MODAL_PROFILE'"
+              exit 1
+            }
 
           # Make profile visible to subsequent steps
           echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
@@ -111,7 +110,8 @@ jobs:
           echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
 
           for attempt in 1 2 3; do
-            if python -m modal deploy "${MODAL_ENTRYPOINT}" --profile "${MODAL_PROFILE}"; then
+            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
+              python -m modal deploy "${MODAL_ENTRYPOINT}" --profile "${MODAL_PROFILE}"; then
               echo "Deploy succeeded."
               exit 0
             fi
