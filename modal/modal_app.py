@@ -11,6 +11,8 @@ import re
 from typing import Optional
 
 import modal
+from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config (env tunables with safe defaults)
@@ -66,6 +68,9 @@ image = (
         "opencv-python-headless==4.10.0.84",
         "numpy==2.0.1",
         "requests>=2.32.3",
+    
+        "fastapi==0.111.0",
+        "python-multipart==0.0.9",
     )
     .env(
         {
@@ -212,8 +217,7 @@ def _load_pipeline():
 # ──────────────────────────────────────────────────────────────────────────────
 # Core worker
 # ──────────────────────────────────────────────────────────────────────────────
-@app.function(
-    name="virtual_stage",
+@app.function(name=\"virtual_stage\", serialized=True,
     serialized=True,
     image=image,
     timeout=900,
@@ -275,8 +279,7 @@ def _auth(request: modal.web.Request):
         return {"ok": False, "status": 401, "err": "unauthorized"}
     return {"ok": True}
 
-@app.function(
-    name="stage",
+@app.function(name=\"stage\", serialized=True,
     serialized=True,
     image=image,
     timeout=900,
@@ -285,7 +288,7 @@ def _auth(request: modal.web.Request):
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")   # ← rename from web_endpoint
-async def stage(request: modal.web.Request):
+async def stage(request: Request):
     """
     POST /stage
     - application/json: { image_b64 | image_url, room_style?, seed?, guidance_scale?, num_inference_steps? }
@@ -293,7 +296,7 @@ async def stage(request: modal.web.Request):
     """
     a = _auth(request)
     if not a["ok"]:
-        return modal.web.Response.json({"error": a["err"]}, status= a["status"])
+        return JSONResponse({"error": a["err"]}, status= a["status"])
 
     try:
         content_type = (request.headers.get("content-type") or "").lower()
@@ -307,7 +310,7 @@ async def stage(request: modal.web.Request):
             form = await request.form()
             uploaded = form.get("file")
             if not uploaded:
-                return modal.web.Response.json({"error": "missing_file"}, status=400)
+                return JSONResponse({"error": "missing_file"}, status=400)
 
             room_style = _validate_room_style(form.get("room_style"))
             if form.get("seed") is not None:
@@ -335,13 +338,13 @@ async def stage(request: modal.web.Request):
             else:
                 image_b64 = payload.get("image_b64")
                 if not image_b64:
-                    return modal.web.Response.json({"error": "missing_image"}, status=400)
+                    return JSONResponse({"error": "missing_image"}, status=400)
                 raw_bytes = _parse_b64(image_b64)
 
         if not raw_bytes:
-            return modal.web.Response.json({"error": "empty_image_bytes"}, status=400)
+            return JSONResponse({"error": "empty_image_bytes"}, status=400)
         if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-            return modal.web.Response.json({"error": "image_too_large"}, status=413)
+            return JSONResponse({"error": "image_too_large"}, status=413)
 
         jpeg_bytes: bytes = virtual_stage.remote(
             raw_bytes,
@@ -350,32 +353,30 @@ async def stage(request: modal.web.Request):
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
         )
-        return modal.web.Response(jpeg_bytes, content_type="image/jpeg")
+        return Response(jpeg_bytes, content_type="image/jpeg")
 
     except ValueError as ve:
-        return modal.web.Response.json({"error": str(ve)}, status=400)
+        return JSONResponse({"error": str(ve)}, status=400)
     except Exception as e:
-        return modal.web.Response.json({"error": "internal_error", "detail": str(e)}, status=500)
+        return JSONResponse({"error": "internal_error", "detail": str(e)}, status=500)
 
-@app.function(
-    name="health",
+@app.function(name=\"health\", serialized=True,
     serialized=True,
     image=image,
     min_containers=1,              # ← rename
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="GET")    # ← rename
-async def health(_request: modal.web.Request):
+async def health(_request: Request):
     try:
-        return modal.web.Response.json(
+        return JSONResponse(
             {"ok": True, "app": APP_NAME, "version": VERSION, "gpu": GPU_TYPE, "hf_cache_mount": HF_CACHE_MOUNT},
             status=200,
         )
     except Exception as e:
-        return modal.web.Response.json({"ok": False, "error": str(e)}, status=500)
+        return JSONResponse({"ok": False, "error": str(e)}, status=500)
 
-@app.function(
-    name="warm",
+@app.function(name=\"warm\", serialized=True,
     serialized=True,
     image=image,
     gpu=GPU_ARG,
@@ -383,12 +384,12 @@ async def health(_request: modal.web.Request):
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")   # ← rename
-async def warm(_request: modal.web.Request):
+async def warm(_request: Request):
     try:
         _load_pipeline()
-        return modal.web.Response.json({"ok": True, "warmed": True}, status=200)
+        return JSONResponse({"ok": True, "warmed": True}, status=200)
     except Exception as e:
-        return modal.web.Response.json({"ok": False, "error": str(e)}, status=500)
+        return JSONResponse({"ok": False, "error": str(e)}, status=500)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Local entry
