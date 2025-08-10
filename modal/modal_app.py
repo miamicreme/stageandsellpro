@@ -8,7 +8,7 @@ import io
 import os
 import json
 import re
-from typing import Optional, Tuple
+from typing import Optional
 
 import modal
 
@@ -31,14 +31,14 @@ DEFAULT_STEPS    = int(os.getenv("STEPS", "28"))
 MAX_EDGE         = int(os.getenv("MAX_EDGE", "1536"))
 JPEG_QUALITY     = int(os.getenv("JPEG_QUALITY", "92"))
 
-MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "20"))      # hard cap on incoming image size
-REQUEST_TIMEOUTS = (5, 20)  # (connect, read) seconds
+MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "20"))
+REQUEST_TIMEOUTS = (5, 20)  # (connect, read)
 
 # GPU strings per new Modal guidance: "CPU" (None), "A10G", "A100-40GB", "H100"
 GPU_TYPE = (os.getenv("GPU_TYPE", "A10G") or "A10G").upper()
 if GPU_TYPE not in {"A10G", "A100-40GB", "H100", "CPU"}:
     GPU_TYPE = "A100-40GB" if GPU_TYPE == "A100" else "A10G"
-GPU_ARG = None if GPU_TYPE == "CPU" else GPU_TYPE  # strings now, not objects
+GPU_ARG = None if GPU_TYPE == "CPU" else GPU_TYPE  # strings, not objects
 
 # Safe ranges
 MIN_STEPS, MAX_STEPS = 5, 50
@@ -51,7 +51,7 @@ MAX_ROOM_STYLE_LEN   = 200
 app = modal.App(APP_NAME)
 
 HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
-NFS_MOUNTS = {HF_CACHE_MOUNT: HF_CACHE}  # mount_path -> NFS (correct direction)
+NFS_MOUNTS = {HF_CACHE_MOUNT: HF_CACHE}  # mount_path -> NFS
 
 image = (
     modal.Image.debian_slim()
@@ -103,7 +103,6 @@ def _canny(image_pil):
     return Image.fromarray(np.stack([edges] * 3, axis=-1))
 
 def _parse_b64(data: str) -> bytes:
-    # Supports data URLs like "data:image/jpeg;base64,AAAA"
     if data.startswith("data:"):
         m = re.match(r"data:[^;]+;base64,(.*)$", data, flags=re.IGNORECASE | re.DOTALL)
         if not m:
@@ -112,7 +111,6 @@ def _parse_b64(data: str) -> bytes:
     try:
         return base64.b64decode(data, validate=True)
     except Exception:
-        # try forgiving decode
         return base64.b64decode(data)
 
 def _fetch_image_from_url(url: str, max_mb: int) -> bytes:
@@ -126,13 +124,10 @@ def _fetch_image_from_url(url: str, max_mb: int) -> bytes:
     headers = {"User-Agent": f"StageSellPro/{VERSION}"}
     with requests.get(url, headers=headers, timeout=REQUEST_TIMEOUTS, stream=True) as r:
         r.raise_for_status()
-
-        # Content-Type guard (best-effort)
         ctype = (r.headers.get("Content-Type") or "").lower()
         if "image" not in ctype and not ctype.startswith("application/octet-stream"):
             raise ValueError("not_an_image_response")
 
-        # Enforce size cap (via header or streaming)
         max_bytes = max_mb * 1024 * 1024
         clen = r.headers.get("Content-Length")
         if clen and int(clen) > max_bytes:
@@ -179,9 +174,6 @@ def _clamp_guidance(val: Optional[float]) -> float:
 _pipeline = None
 
 def _load_pipeline():
-    """
-    Returns: (pipe, device_desc)
-    """
     global _pipeline
     if _pipeline is not None:
         return _pipeline, "cached"
@@ -226,7 +218,7 @@ def _load_pipeline():
     image=image,
     timeout=900,
     gpu=GPU_ARG,
-    keep_warm=1,                    # keep 1 warm worker for low-latency prod
+    min_containers=1,              # ← Modal 1.0 rename (was keep_warm)
     network_file_systems=NFS_MOUNTS,
 )
 def virtual_stage(
@@ -289,20 +281,19 @@ def _auth(request: modal.web.Request):
     image=image,
     timeout=900,
     gpu=GPU_ARG,
-    keep_warm=1,
+    min_containers=1,              # ← rename
     network_file_systems=NFS_MOUNTS,
 )
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")   # ← rename from web_endpoint
 async def stage(request: modal.web.Request):
     """
     POST /stage
     - application/json: { image_b64 | image_url, room_style?, seed?, guidance_scale?, num_inference_steps? }
     - multipart/form-data: file=<binary>, room_style?, seed?, guidance_scale?, num_inference_steps?
     """
-    # Auth
     a = _auth(request)
     if not a["ok"]:
-        return modal.web.Response.json({"error": a["err"]}, status=a["status"])
+        return modal.web.Response.json({"error": a["err"]}, status= a["status"])
 
     try:
         content_type = (request.headers.get("content-type") or "").lower()
@@ -362,32 +353,36 @@ async def stage(request: modal.web.Request):
         return modal.web.Response(jpeg_bytes, content_type="image/jpeg")
 
     except ValueError as ve:
-        # Known/validated errors
         return modal.web.Response.json({"error": str(ve)}, status=400)
     except Exception as e:
-        # Unknown error
         return modal.web.Response.json({"error": "internal_error", "detail": str(e)}, status=500)
 
-@app.function(name="health", serialized=True, image=image, network_file_systems=NFS_MOUNTS, keep_warm=1)
-@modal.web_endpoint(method="GET")
+@app.function(
+    name="health",
+    serialized=True,
+    image=image,
+    min_containers=1,              # ← rename
+    network_file_systems=NFS_MOUNTS,
+)
+@modal.fastapi_endpoint(method="GET")    # ← rename
 async def health(_request: modal.web.Request):
     try:
-        # Fast checks only; model load is done in /warm
         return modal.web.Response.json(
-            {
-                "ok": True,
-                "app": APP_NAME,
-                "version": VERSION,
-                "gpu": GPU_TYPE,
-                "hf_cache_mount": HF_CACHE_MOUNT,
-            },
+            {"ok": True, "app": APP_NAME, "version": VERSION, "gpu": GPU_TYPE, "hf_cache_mount": HF_CACHE_MOUNT},
             status=200,
         )
     except Exception as e:
         return modal.web.Response.json({"ok": False, "error": str(e)}, status=500)
 
-@app.function(name="warm", serialized=True, image=image, gpu=GPU_ARG, keep_warm=1, network_file_systems=NFS_MOUNTS)
-@modal.web_endpoint(method="POST")
+@app.function(
+    name="warm",
+    serialized=True,
+    image=image,
+    gpu=GPU_ARG,
+    min_containers=1,              # ← rename
+    network_file_systems=NFS_MOUNTS,
+)
+@modal.fastapi_endpoint(method="POST")   # ← rename
 async def warm(_request: modal.web.Request):
     try:
         _load_pipeline()
@@ -400,6 +395,7 @@ async def warm(_request: modal.web.Request):
 # ──────────────────────────────────────────────────────────────────────────────
 @app.local_entrypoint()
 def main():
-    print("Dev:\n  modal serve modal/modal_app.py")
-    print("Deploy:\n  modal deploy modal/modal_app.py")
+    print("Dev:\n  python -m modal serve modal/modal_app.py")
+    print("Deploy:\n  python -m modal deploy modal/modal_app.py")
+    print("Run local entrypoint:\n  python -m modal run modal/modal_app.py")
     print("Endpoints:\n  GET  /health\n  POST /warm\n  POST /stage")
