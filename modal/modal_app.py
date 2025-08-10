@@ -404,12 +404,3 @@ async def warm(_request):  # type: ignore[no-untyped-def]
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Local entry
-# ──────────────────────────────────────────────────────────────────────────────
-@app.local_entrypoint()
-def main():
-    print("Dev:\n  python -m modal serve modal/modal_app.py")
-    print("Deploy:\n  python -m modal deploy modal/modal_app.py")
-    print("Run local entrypoint:\n  python -m modal run modal/modal_app.py")
-    print("Endpoints:\n  GET  /health\n  POST /warm\n  POST /stage")
