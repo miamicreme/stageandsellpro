@@ -6,7 +6,7 @@ import base64
 import io
 import os
 import json
-from typing import Optional, Tuple
+from typing import Optional
 
 import modal
 
@@ -74,7 +74,6 @@ def _canny(image_pil):
     from PIL import Image
     img = np.array(image_pil.convert("RGB"))
     edges = cv2.Canny(img, 100, 200)
-    # replicate single channel to 3 channels as expected by ControlNet
     return Image.fromarray(np.stack([edges] * 3, axis=-1))
 
 _pipeline = None
@@ -103,7 +102,6 @@ def _load_pipeline():
     except Exception:
         pass
     try:
-        # Prefer CPU offload model mgmt when not on CUDA; otherwise use CUDA with CPU offload for memory balance
         pipe.enable_sequential_cpu_offload() if not use_cuda else pipe.enable_model_cpu_offload()
     except Exception:
         pass
@@ -117,14 +115,13 @@ def _load_pipeline():
 @app.function(
     image=image,
     timeout=900,
-    # IMPORTANT: dict is {NetworkFileSystem: mount_path}
-    network_file_systems={HF_CACHE: HF_CACHE_MOUNT},
+    # ✅ Correct order: {mount_path: NetworkFileSystem}
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
     gpu=GPU_ARG,
 )
-@modal.web_endpoint(method="POST", label="stage")
+@modal.fastapi_endpoint(method="POST", label="stage")
 async def stage_http(request):
     try:
-        # Simple header key check
         if API_KEY and request.headers.get("x-api-key") != API_KEY:
             return modal.Response(
                 json.dumps({"error": "unauthorized"}).encode(),
@@ -152,7 +149,6 @@ async def stage_http(request):
             room_style = payload.get("room_style", room_style)
             if payload.get("image_url"):
                 import requests
-
                 r = requests.get(payload["image_url"], timeout=10)
                 r.raise_for_status()
                 raw_bytes = r.content
@@ -168,7 +164,7 @@ async def stage_http(request):
 
         out = virtual_stage.remote(raw_bytes, room_style)
 
-        # If the worker returned a JSON error blob for any reason, forward with 500
+        # If worker returned a JSON error, forward as 500
         try:
             maybe = json.loads(out.decode("utf-8"))
             if isinstance(maybe, dict) and maybe.get("error"):
@@ -188,7 +184,7 @@ async def stage_http(request):
 @app.function(
     image=image,
     timeout=900,
-    network_file_systems={HF_CACHE: HF_CACHE_MOUNT},
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
     gpu=GPU_ARG,
 )
 def virtual_stage(
@@ -220,12 +216,12 @@ def virtual_stage(
 
     with torch.inference_mode():
         result = pipe(
-            image=control,
             prompt=f"{room_style}, photorealistic, high detail, interior design",
             negative_prompt=negative_prompt,
-            generator=generator,
+            control_image=control,  # ✅ SDXL ControlNet expects control_image
             guidance_scale=g,
             num_inference_steps=steps,
+            generator=generator,
         )
 
     return _to_jpeg_bytes(result.images[0], JPEG_QUALITY)
