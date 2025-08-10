@@ -61,7 +61,7 @@ jobs:
       - name: Configure Modal token
         shell: bash
         env:
-          # NOTE: Use CI_ names so Modal CLI won't auto-read them from env
+          # Use CI_ names so Modal CLI won't auto-read them from env
           CI_MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           CI_MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           MODAL_PROFILE: prod
@@ -79,7 +79,7 @@ jobs:
             --token-secret "$CI_MODAL_TOKEN_SECRET" \
             --profile "$MODAL_PROFILE"
 
-          # Verify strictly from the saved profile (explicitly remove any accidental MODAL_* env)
+          # Verify strictly from the saved profile (remove any accidental MODAL_* env)
           env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
             python -m modal token get --profile "$MODAL_PROFILE" >/dev/null 2>&1 || {
               echo "::error::Failed to read back Modal token for profile '$MODAL_PROFILE'"
