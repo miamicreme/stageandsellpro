@@ -18,8 +18,8 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
-  MODAL_ENTRYPOINT: "modal/modal_app.py" # change if your entry file is elsewhere
-  MODAL_PROFILE: "prod"                  # single source of truth for profile
+  MODAL_ENTRYPOINT: "modal/modal_app.py"  # change if your entry file is elsewhere
+  MODAL_PROFILE: "prod"                   # single source of truth for profile
 
 jobs:
   deploy:
@@ -57,7 +57,7 @@ jobs:
           fi
           python -m modal --version >/dev/null
 
-      # --- Modal auth (writes to named profile, then verifies) ---
+      # --- Modal auth (writes to named profile, then verifies by reading ~/.modal.toml) ---
       - name: Configure Modal token
         shell: bash
         env:
@@ -79,15 +79,33 @@ jobs:
             --token-secret "$CI_MODAL_TOKEN_SECRET" \
             --profile "$MODAL_PROFILE"
 
-          # Verify strictly from the saved profile (remove any accidental MODAL_* env)
-          env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
-            python -m modal token get --profile "$MODAL_PROFILE" >/dev/null 2>&1 || {
-              echo "::error::Failed to read back Modal token for profile '$MODAL_PROFILE'"
-              exit 1
-            }
+          # Sanity check: verify ~/.modal.toml has prod profile with keys
+          python - <<'PY'
+import sys, pathlib
+p = pathlib.Path.home() / ".modal.toml"
+if not p.exists():
+    print("::error::~/.modal.toml not found after token set")
+    sys.exit(1)
+import tomllib
+try:
+    data = tomllib.loads(p.read_text())
+except Exception as e:
+    print(f"::error::Failed to parse ~/.modal.toml: {e}")
+    sys.exit(1)
+prod = data.get("prod") or {}
+tid = prod.get("token_id")
+ts  = prod.get("token_secret")
+if not (tid and ts):
+    print("::error::Missing token_id or token_secret in [prod] profile")
+    sys.exit(2)
+print(f"Modal token appears set for profile 'prod' (token_id length={len(tid)})")
+PY
 
           # Make profile visible to subsequent steps
           echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
+
+          # IMPORTANT: never echo secrets; clear env
+          unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
 
       - name: Validate entrypoint exists
         shell: bash
@@ -124,7 +142,7 @@ jobs:
 
       # ================= Alerts on failure (email + SMS) =================
       - name: Send failure email (Resend)
-        if: failure() && env.RESEND_API_KEY != '' && env.ALERT_EMAIL_FROM != '' && env.ALERT_EMAIL_TO != ''
+        if: failure()
         shell: bash
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -132,6 +150,9 @@ jobs:
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: |
           set -euo pipefail
+          # Skip if any required secret is missing
+          [ -n "${RESEND_API_KEY:-}" ] && [ -n "${ALERT_EMAIL_FROM:-}" ] && [ -n "${ALERT_EMAIL_TO:-}" ] || exit 0
+
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           BODY=$(cat <<EOF
           {
@@ -148,7 +169,7 @@ jobs:
             -d "${BODY}"
 
       - name: Send failure SMS (Twilio)
-        if: failure() && env.TWILIO_ACCOUNT_SID != '' && env.TWILIO_AUTH_TOKEN != '' && env.TWILIO_FROM != '' && env.ALERT_SMS_TO != ''
+        if: failure()
         shell: bash
         env:
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
@@ -157,6 +178,9 @@ jobs:
           ALERT_SMS_TO: ${{ secrets.ALERT_SMS_TO }}
         run: |
           set -euo pipefail
+          # Skip if any required secret is missing
+          [ -n "${TWILIO_ACCOUNT_SID:-}" ] && [ -n "${TWILIO_AUTH_TOKEN:-}" ] && [ -n "${TWILIO_FROM:-}" ] && [ -n "${ALERT_SMS_TO:-}" ] || exit 0
+
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           MSG="❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME} (${GITHUB_SHA::7}) ${RUN_URL}"
           curl -s -X POST "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json" \
