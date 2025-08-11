@@ -11,6 +11,7 @@ import re
 from typing import Optional, TYPE_CHECKING
 
 import modal
+
 if TYPE_CHECKING:
     # Editor/type-checker only; not imported at runtime on the runner
     from fastapi import Request, Response
@@ -22,23 +23,23 @@ if TYPE_CHECKING:
 APP_NAME = "stage-sell-pro-pipeline"
 VERSION = os.getenv("VERSION", "2025-08-09")
 
-HF_CACHE_NAME  = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
+HF_CACHE_NAME = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
 HF_CACHE_MOUNT = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
 
 API_KEY = os.getenv("API_KEY", "")
 
-SDXL_BASE        = os.getenv("SDXL_BASE", "stabilityai/stable-diffusion-xl-base-1.0")
+SDXL_BASE = os.getenv("SDXL_BASE", "stabilityai/stable-diffusion-xl-base-1.0")
 CONTROLNET_MODEL = os.getenv("CONTROLNET_MODEL", "diffusers/controlnet-canny-sdxl-1.0")
 
 DEFAULT_GUIDANCE = float(os.getenv("GUIDANCE", "5.0"))
-DEFAULT_STEPS    = int(os.getenv("STEPS", "28"))
-MAX_EDGE         = int(os.getenv("MAX_EDGE", "1536"))
-JPEG_QUALITY     = int(os.getenv("JPEG_QUALITY", "92"))
+DEFAULT_STEPS = int(os.getenv("STEPS", "28"))
+MAX_EDGE = int(os.getenv("MAX_EDGE", "1536"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "92"))
 
-MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "20"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 REQUEST_TIMEOUTS = (5, 20)  # (connect, read)
 
-# GPU strings per new Modal guidance: "CPU" (None), "A10G", "A100-40GB", "H100"
+# GPU strings per Modal guidance: "CPU" (None), "A10G", "A100-40GB", "H100"
 GPU_TYPE = (os.getenv("GPU_TYPE", "A10G") or "A10G").upper()
 if GPU_TYPE not in {"A10G", "A100-40GB", "H100", "CPU"}:
     GPU_TYPE = "A100-40GB" if GPU_TYPE == "A100" else "A10G"
@@ -47,30 +48,33 @@ GPU_ARG = None if GPU_TYPE == "CPU" else GPU_TYPE  # strings, not objects
 # Safe ranges
 MIN_STEPS, MAX_STEPS = 5, 50
 MIN_GUIDE, MAX_GUIDE = 1.0, 12.0
-MAX_ROOM_STYLE_LEN   = 200
+MAX_ROOM_STYLE_LEN = 200
 
 # ──────────────────────────────────────────────────────────────────────────────
 # App + NFS + Image
 # ──────────────────────────────────────────────────────────────────────────────
 app = modal.App(APP_NAME)
 
+# Persist HF cache between runs
 HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
 NFS_MOUNTS = {HF_CACHE_MOUNT: HF_CACHE}  # mount_path -> NFS
 
+# IMPORTANT: fix the accelerate vs numpy conflict by pinning numpy<2.0
 image = (
     modal.Image.debian_slim()
     .apt_install("ffmpeg")
     .pip_install(
+        # Core stack
         "torch==2.3.1",
         "transformers==4.44.0",
         "diffusers==0.31.0",
         "accelerate==0.33.0",
+        "numpy==1.26.4",  # <— compatible with accelerate 0.33.0
         "safetensors>=0.4.3",
         "Pillow==10.4.0",
         "opencv-python-headless==4.10.0.84",
-        "numpy==2.0.1",
         "requests>=2.32.3",
-        # Needed by @modal.fastapi_endpoint (installed in the image, not on the runner)
+        # FastAPI only needed inside the Modal image (for fastapi_endpoint)
         "fastapi==0.111.0",
         "python-multipart==0.0.9",
     )
@@ -97,10 +101,12 @@ def _resize_long_edge(pil_img, max_edge: int):
     r = float(max_edge) / float(long_edge)
     return pil_img.resize((int(round(w * r)), int(round(h * r))), Image.LANCZOS)
 
+
 def _to_jpeg_bytes(pil_img, quality: int = JPEG_QUALITY) -> bytes:
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue()
+
 
 def _canny(image_pil):
     import numpy as np, cv2
@@ -108,6 +114,7 @@ def _canny(image_pil):
     img = np.array(image_pil.convert("RGB"))
     edges = cv2.Canny(img, 100, 200)
     return Image.fromarray(np.stack([edges] * 3, axis=-1))
+
 
 def _parse_b64(data: str) -> bytes:
     if data.startswith("data:"):
@@ -119,6 +126,7 @@ def _parse_b64(data: str) -> bytes:
         return base64.b64decode(data, validate=True)
     except Exception:
         return base64.b64decode(data)
+
 
 def _fetch_image_from_url(url: str, max_mb: int) -> bytes:
     from urllib.parse import urlparse
@@ -151,11 +159,13 @@ def _fetch_image_from_url(url: str, max_mb: int) -> bytes:
             buf.write(chunk)
         return buf.getvalue()
 
+
 def _validate_room_style(s: Optional[str]) -> str:
     s = (s or "modern luxury").strip()
     if len(s) > MAX_ROOM_STYLE_LEN:
         s = s[:MAX_ROOM_STYLE_LEN]
     return s
+
 
 def _clamp_steps(val: Optional[int]) -> int:
     if val is None:
@@ -166,6 +176,7 @@ def _clamp_steps(val: Optional[int]) -> int:
         v = DEFAULT_STEPS
     return max(MIN_STEPS, min(MAX_STEPS, v))
 
+
 def _clamp_guidance(val: Optional[float]) -> float:
     if val is None:
         return DEFAULT_GUIDANCE
@@ -175,10 +186,12 @@ def _clamp_guidance(val: Optional[float]) -> float:
         v = DEFAULT_GUIDANCE
     return max(MIN_GUIDE, min(MAX_GUIDE, v))
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline Loader (cached per worker)
 # ──────────────────────────────────────────────────────────────────────────────
 _pipeline = None
+
 
 def _load_pipeline():
     global _pipeline
@@ -198,34 +211,38 @@ def _load_pipeline():
         SDXL_BASE, controlnet=controlnet, torch_dtype=dtype, use_safetensors=True, cache_dir=HF_CACHE_MOUNT
     )
 
-    try: pipe.enable_vae_slicing()
-    except Exception: pass
     try:
+        pipe.enable_vae_slicing()
+    except Exception:
+        pass
+    try:
+        # Prefer CPU offload if CUDA is present (VRAM-friendly)
         if use_cuda:
             pipe.enable_model_cpu_offload()
         else:
             pipe.enable_sequential_cpu_offload()
-    except Exception: pass
+    except Exception:
+        pass
 
     device_desc = "cpu"
     if use_cuda:
         pipe.to("cuda")
         import torch as _t
+
         device_desc = f"cuda:{_t.cuda.current_device()}"
 
     _pipeline = pipe
     return _pipeline, device_desc
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Core worker
 # ──────────────────────────────────────────────────────────────────────────────
 @app.function(
     name="virtual_stage",
-    serialized=True,
     image=image,
     timeout=900,
     gpu=GPU_ARG,
-    min_containers=1,              # Modal 1.0 rename (was keep_warm)
     network_file_systems=NFS_MOUNTS,
 )
 def virtual_stage(
@@ -239,7 +256,7 @@ def virtual_stage(
     from PIL import Image, UnidentifiedImageError
     import torch
 
-    g     = _clamp_guidance(guidance_scale)
+    g = _clamp_guidance(guidance_scale)
     steps = _clamp_steps(num_inference_steps)
 
     pipe, _device_desc = _load_pipeline()
@@ -262,6 +279,7 @@ def virtual_stage(
         except Exception:
             generator = torch.Generator().manual_seed(int(seed))
 
+    # SDXL + ControlNet pipeline call
     with torch.inference_mode():
         result = pipe(
             image=control,
@@ -274,21 +292,21 @@ def virtual_stage(
 
     return _to_jpeg_bytes(result.images[0], JPEG_QUALITY)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Web endpoints
+# Web endpoints (FastAPI routed by Modal)
 # ──────────────────────────────────────────────────────────────────────────────
 def _auth(request):  # avoid importing FastAPI types at module import time
     if API_KEY and request.headers.get("x-api-key") != API_KEY:
         return {"ok": False, "status": 401, "err": "unauthorized"}
     return {"ok": True}
 
+
 @app.function(
     name="stage",
-    serialized=True,
     image=image,
     timeout=900,
     gpu=GPU_ARG,
-    min_containers=1,
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")
@@ -321,14 +339,20 @@ async def stage(request):  # type: ignore[no-untyped-def]
 
             room_style = _validate_room_style(form.get("room_style"))
             if form.get("seed") is not None:
-                try: seed = int(form.get("seed"))
-                except Exception: pass
+                try:
+                    seed = int(form.get("seed"))
+                except Exception:
+                    pass
             if form.get("guidance_scale") is not None:
-                try: guidance_scale = float(form.get("guidance_scale"))
-                except Exception: pass
+                try:
+                    guidance_scale = float(form.get("guidance_scale"))
+                except Exception:
+                    pass
             if form.get("num_inference_steps") is not None:
-                try: num_inference_steps = int(form.get("num_inference_steps"))
-                except Exception: pass
+                try:
+                    num_inference_steps = int(form.get("num_inference_steps"))
+                except Exception:
+                    pass
 
             raw_bytes = await uploaded.read()
 
@@ -367,11 +391,10 @@ async def stage(request):  # type: ignore[no-untyped-def]
     except Exception as e:
         return JSONResponse({"error": "internal_error", "detail": str(e)}, status_code=500)
 
+
 @app.function(
     name="health",
-    serialized=True,
     image=image,
-    min_containers=1,
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="GET")
@@ -386,12 +409,11 @@ async def health(_request):  # type: ignore[no-untyped-def]
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
+
 @app.function(
     name="warm",
-    serialized=True,
     image=image,
     gpu=GPU_ARG,
-    min_containers=1,
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")
