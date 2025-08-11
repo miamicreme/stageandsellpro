@@ -1,103 +1,3 @@
-name: Modal Deploy
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main, master, develop ]
-    paths:
-      - "modal/**"
-      - "modal_app.py"
-      - ".github/workflows/modal-deploy.yml"
-
-concurrency:
-  group: modal-deploy-${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-env:
-  PYTHON_VERSION: "3.11"
-  MODAL_ENTRYPOINT: "modal/modal_app.py"
-  MODAL_PROFILE: "prod"
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements-ci.txt') }}
-          restore-keys: |
-            pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
-
-      - name: Install Modal CLI (runner-only)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          if [ -f requirements-ci.txt ]; then
-            pip install -r requirements-ci.txt
-          else
-            pip install 'modal>=1.1,<2'
-          fi
-          python -m modal --version >/dev/null
-
-      - name: Configure Modal token
-        shell: bash
-        env:
-          CI_MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          CI_MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-          MODAL_PROFILE: prod
-        run: |
-          set -euo pipefail
-
-          if [ -z "${CI_MODAL_TOKEN_ID:-}" ] || [ -z "${CI_MODAL_TOKEN_SECRET:-}" ]; then
-            echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
-            exit 1
-          fi
-
-          # Write creds into the prod profile (no MODAL_* env exported)
-          python -m modal token set \
-            --token-id "$CI_MODAL_TOKEN_ID" \
-            --token-secret "$CI_MODAL_TOKEN_SECRET" \
-            --profile "$MODAL_PROFILE"
-
-          # Verify ~/.modal.toml contains [prod] with token_id and token_secret
-          python -c "import sys,pathlib,tomllib; p=pathlib.Path.home() / '.modal.toml'; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get('prod') or {}; sys.exit(0 if (pr.get('token_id') and pr.get('token_secret')) else 2)" || {
-            echo '::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)'
-            exit 1
-          }
-
-          # Make profile visible to subsequent steps
-          echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
-
-          # IMPORTANT: never echo secrets; clear env
-          unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
-
-      - name: Validate entrypoint exists
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -f "$MODAL_ENTRYPOINT" ]; then
-            echo "::error file=$MODAL_ENTRYPOINT::Modal entrypoint not found"
-            exit 1
-          fi
-
       - name: Deploy to Modal
         shell: bash
         env:
@@ -108,9 +8,19 @@ jobs:
           echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
           echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
 
+          # Confirm CLI version
+          python -m modal --version || true
+
+          # Show if any --profile is sneaking in from env/aliases
+          echo "Searching for stray --profile flags in repo..."
+          grep -R --line-number -- '--profile' || true
+
+          # The only allowed command (NO --profile on deploy):
+          CMD=(python -m modal deploy "${MODAL_ENTRYPOINT}")
+          echo "+ ${CMD[@]}"
+
           for attempt in 1 2 3; do
-            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
-              python -m modal deploy "${MODAL_ENTRYPOINT}" --profile "${MODAL_PROFILE}"; then
+            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET "${CMD[@]}"; then
               echo "Deploy succeeded."
               exit 0
             fi
@@ -120,42 +30,3 @@ jobs:
 
           echo "::error::Modal deploy failed after 3 attempts."
           exit 1
-
-      - name: Send failure email (Resend)
-        if: failure()
-        shell: bash
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
-          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-        run: |
-          set -euo pipefail
-          [ -n "${RESEND_API_KEY:-}" ] && [ -n "${ALERT_EMAIL_FROM:-}" ] && [ -n "${ALERT_EMAIL_TO:-}" ] || exit 0
-          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          SUBJECT="❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}"
-          TEXT="Workflow failed. Commit: ${GITHUB_SHA::7}\nRun: ${RUN_URL}\nBranch: ${GITHUB_REF_NAME}"
-          JSON=$(printf '{"from":"%s","to":["%s"],"subject":"%s","text":"%s"}' \
-            "$ALERT_EMAIL_FROM" "$ALERT_EMAIL_TO" "$SUBJECT" "$TEXT")
-          curl -s -X POST https://api.resend.com/emails \
-            -H "Authorization: Bearer ${RESEND_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "${JSON}"
-
-      - name: Send failure SMS (Twilio)
-        if: failure()
-        shell: bash
-        env:
-          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
-          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
-          ALERT_SMS_TO: ${{ secrets.ALERT_SMS_TO }}
-        run: |
-          set -euo pipefail
-          [ -n "${TWILIO_ACCOUNT_SID:-}" ] && [ -n "${TWILIO_AUTH_TOKEN:-}" ] && [ -n "${TWILIO_FROM:-}" ] && [ -n "${ALERT_SMS_TO:-}" ] || exit 0
-          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          MSG="❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME} (${GITHUB_SHA::7}) ${RUN_URL}"
-          curl -s -X POST "https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json" \
-            --data-urlencode "From=${TWILIO_FROM}" \
-            --data-urlencode "To=${ALERT_SMS_TO}" \
-            --data-urlencode "Body=${MSG}" \
-            -u "${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}"
