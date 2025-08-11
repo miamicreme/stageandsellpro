@@ -10,8 +10,8 @@ on:
       - ".github/workflows/modal-deploy.yml"
 
 concurrency:
-  group: modal-deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: modal-deploy-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -61,7 +61,6 @@ jobs:
       - name: Configure Modal token
         shell: bash
         env:
-          # Use CI_ names so Modal CLI won't auto-read them from env
           CI_MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           CI_MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           MODAL_PROFILE: prod
@@ -80,7 +79,7 @@ jobs:
             --profile "$MODAL_PROFILE"
 
           # Sanity check: verify ~/.modal.toml has prod profile with keys
-          python - <<'PY'
+          python - <<EOF
 import sys, pathlib
 p = pathlib.Path.home() / ".modal.toml"
 if not p.exists():
@@ -99,7 +98,8 @@ if not (tid and ts):
     print("::error::Missing token_id or token_secret in [prod] profile")
     sys.exit(2)
 print(f"Modal token appears set for profile 'prod' (token_id length={len(tid)})")
-PY
+sys.exit(0)
+EOF
 
           # Make profile visible to subsequent steps
           echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
@@ -154,15 +154,11 @@ PY
           [ -n "${RESEND_API_KEY:-}" ] && [ -n "${ALERT_EMAIL_FROM:-}" ] && [ -n "${ALERT_EMAIL_TO:-}" ] || exit 0
 
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          BODY=$(cat <<EOF
-          {
-            "from": "${ALERT_EMAIL_FROM}",
-            "to": ["${ALERT_EMAIL_TO}"],
-            "subject": "❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}",
-            "text": "Workflow failed. Commit: ${GITHUB_SHA::7}\nRun: ${RUN_URL}\nBranch: ${GITHUB_REF_NAME}"
-          }
-          EOF
-          )
+          MSG_SUBJECT="❌ Modal deploy failed: ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}"
+          MSG_TEXT="Workflow failed. Commit: ${GITHUB_SHA::7}\nRun: ${RUN_URL}\nBranch: ${GITHUB_REF_NAME}"
+          BODY=$(jq -nc --arg from "$ALERT_EMAIL_FROM" --arg to "$ALERT_EMAIL_TO" --arg subject "$MSG_SUBJECT" --arg text "$MSG_TEXT" \
+            '{from:$from,to:[$to],subject:$subject,text:$text}')
+
           curl -s -X POST https://api.resend.com/emails \
             -H "Authorization: Bearer ${RESEND_API_KEY}" \
             -H "Content-Type: application/json" \
