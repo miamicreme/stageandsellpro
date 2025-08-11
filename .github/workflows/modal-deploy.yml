@@ -53,7 +53,6 @@ jobs:
           MODAL_PROFILE: prod
         run: |
           set -euo pipefail
-
           if [ -z "${CI_MODAL_TOKEN_ID:-}" ] || [ -z "${CI_MODAL_TOKEN_SECRET:-}" ]; then
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
