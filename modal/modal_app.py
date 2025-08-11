@@ -117,7 +117,7 @@ jobs:
           SSP_API_KEY: ${{ secrets.STAGESELLPRO_KEY }}
 
           # Optional: override; if empty we auto-pick by branch (main=business, others=off)
-          KEEPWARM_MODE: ""                 # off | business | always
+          KEEPWARM_MODE: off""                 # off | business | always
           KEEPWARM_TZ: "America/New_York"   # for business mode
           KEEPWARM_HOURS: "09:00-18:00"     # for business mode
           KEEPWARM_WEEKDAYS: "1-5"          # for business mode
