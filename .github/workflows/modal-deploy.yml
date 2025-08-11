@@ -65,22 +65,28 @@ jobs:
           MODAL_PROFILE: prod
         run: |
           set -euo pipefail
+
           if [ -z "${CI_MODAL_TOKEN_ID:-}" ] || [ -z "${CI_MODAL_TOKEN_SECRET:-}" ]; then
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
           fi
+
+          # Write creds into the prod profile (no MODAL_* env exported)
           python -m modal token set \
             --token-id "$CI_MODAL_TOKEN_ID" \
             --token-secret "$CI_MODAL_TOKEN_SECRET" \
             --profile "$MODAL_PROFILE"
-          # Verify ~/.modal.toml contains [prod] with token_id and token_secret (no heredocs)
-          python - <<'PY' >/dev/null 2>&1 || true
-PY
-          python -c "import sys, pathlib, tomllib; p=pathlib.Path.home()/'.modal.toml'; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get('prod') or {}; sys.exit(0 if (pr.get('token_id') and pr.get('token_secret')) else 2)" || {
+
+          # Verify ~/.modal.toml contains [prod] with token_id and token_secret
+          python -c "import sys,pathlib,tomllib; p=pathlib.Path.home() / '.modal.toml'; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get('prod') or {}; sys.exit(0 if (pr.get('token_id') and pr.get('token_secret')) else 2)" || {
             echo '::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)'
             exit 1
           }
+
+          # Make profile visible to subsequent steps
           echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
+
+          # IMPORTANT: never echo secrets; clear env
           unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
 
       - name: Validate entrypoint exists
@@ -101,6 +107,7 @@ PY
           set -euo pipefail
           echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
           echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
+
           for attempt in 1 2 3; do
             if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
               python -m modal deploy "${MODAL_ENTRYPOINT}" --profile "${MODAL_PROFILE}"; then
@@ -110,6 +117,7 @@ PY
             echo "Deploy failed (attempt ${attempt}). Retrying in 10s..."
             sleep 10
           done
+
           echo "::error::Modal deploy failed after 3 attempts."
           exit 1
 
