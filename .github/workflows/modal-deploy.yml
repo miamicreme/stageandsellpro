@@ -45,15 +45,15 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
 
-      -- name: Install Modal CLI (runner-only)
-  shell: bash
-  run: |
-    set -euo pipefail
-    python -m pip install --upgrade pip
-    if [ -f requirements-ci.txt ]; then
-      pip install -r requirements-ci.txt
-    else
-      pip install 'modal>=1.1,<2'
-    fi
-    python -m modal --version >/dev/null
+       - name: Install Modal CLI (runner-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements-ci.txt ]; then
+            pip install -r requirements-ci.txt
+          else
+            pip install 'modal>=1.1,<2'
+          fi
+          python -m modal --version >/dev/null
 
