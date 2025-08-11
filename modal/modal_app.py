@@ -12,6 +12,14 @@ from typing import Optional, TYPE_CHECKING
 
 import modal
 
+# Make FastAPI Request type available at runtime in the Modal image,
+# while not breaking local/CI when FastAPI isn't installed there.
+try:
+    from fastapi import Request as FastAPIRequest  # available inside Modal image
+except Exception:  # pragma: no cover
+    class FastAPIRequest:  # type: ignore
+        headers: dict
+
 if TYPE_CHECKING:
     from fastapi import Request, Response
     from fastapi.responses import JSONResponse
@@ -287,7 +295,7 @@ def _auth(request):
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")
-async def stage(request):  # type: ignore[no-untyped-def]
+async def stage(request: FastAPIRequest):  # <-- typed so FastAPI injects the Request
     from fastapi import Response
     from fastapi.responses import JSONResponse
 
@@ -367,7 +375,7 @@ async def stage(request):  # type: ignore[no-untyped-def]
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="GET")
-async def health(_request):  # type: ignore[no-untyped-def]
+async def health():  # <-- no args
     from fastapi.responses import JSONResponse
 
     try:
@@ -384,7 +392,7 @@ async def health(_request):  # type: ignore[no-untyped-def]
     network_file_systems=NFS_MOUNTS,
 )
 @modal.fastapi_endpoint(method="POST")
-async def warm(_request):  # type: ignore[no-untyped-def]
+async def warm():  # <-- no args
     from fastapi.responses import JSONResponse
 
     try:
