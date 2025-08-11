@@ -1,32 +1,36 @@
-      - name: Deploy to Modal
-        shell: bash
-        env:
-          MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
-          MODAL_ENTRYPOINT: ${{ env.MODAL_ENTRYPOINT }}
-        run: |
-          set -euo pipefail
-          echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
-          echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
+name: Modal Deploy
 
-          # Confirm CLI version
-          python -m modal --version || true
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master, develop ]
+    paths:
+      - "modal/**"
+      - "modal_app.py"
+      - ".github/workflows/modal-deploy.yml"
 
-          # Show if any --profile is sneaking in from env/aliases
-          echo "Searching for stray --profile flags in repo..."
-          grep -R --line-number -- '--profile' || true
+concurrency:
+  group: modal-deploy-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
 
-          # The only allowed command (NO --profile on deploy):
-          CMD=(python -m modal deploy "${MODAL_ENTRYPOINT}")
-          echo "+ ${CMD[@]}"
+permissions:
+  contents: read
 
-          for attempt in 1 2 3; do
-            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET "${CMD[@]}"; then
-              echo "Deploy succeeded."
-              exit 0
-            fi
-            echo "Deploy failed (attempt ${attempt}). Retrying in 10s..."
-            sleep 10
-          done
+env:
+  PYTHON_VERSION: "3.11"
+  MODAL_ENTRYPOINT: "modal/modal_app.py"
+  MODAL_PROFILE: "prod"
 
-          echo "::error::Modal deploy failed after 3 attempts."
-          exit 1
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses:
