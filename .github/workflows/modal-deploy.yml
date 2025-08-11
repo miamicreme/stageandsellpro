@@ -33,4 +33,73 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Python
-        uses:
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Modal CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install 'modal>=1.1,<2'
+          python -m modal --version || true
+
+      - name: Configure Modal token
+        shell: bash
+        env:
+          CI_MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          CI_MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_PROFILE: prod
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CI_MODAL_TOKEN_ID:-}" ] || [ -z "${CI_MODAL_TOKEN_SECRET:-}" ]; then
+            echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
+            exit 1
+          fi
+
+          # Write creds into the prod profile
+          python -m modal token set \
+            --token-id "$CI_MODAL_TOKEN_ID" \
+            --token-secret "$CI_MODAL_TOKEN_SECRET" \
+            --profile "$MODAL_PROFILE"
+
+          # Verify ~/.modal.toml has [prod] with token_id + token_secret
+          python -c 'import sys, pathlib, tomllib; p=pathlib.Path.home()/".modal.toml"; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get("prod") or {}; sys.exit(0 if (pr.get("token_id") and pr.get("token_secret")) else 2)' \
+          || { echo "::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)"; exit 1; }
+
+          echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
+          unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
+
+      - name: Validate entrypoint exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$MODAL_ENTRYPOINT" ]; then
+            echo "::error file=$MODAL_ENTRYPOINT::Modal entrypoint not found"
+            exit 1
+          fi
+
+      - name: Deploy to Modal
+        shell: bash
+        env:
+          MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
+          MODAL_ENTRYPOINT: ${{ env.MODAL_ENTRYPOINT }}
+        run: |
+          set -euo pipefail
+          echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
+          echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
+
+          for attempt in 1 2 3; do
+            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
+              python -m modal deploy "${MODAL_ENTRYPOINT}"; then
+              echo "Deploy succeeded."
+              exit 0
+            fi
+            echo "Deploy failed (attempt ${attempt}). Retrying in 10s..."
+            sleep 10
+          done
+
+          echo "::error::Modal deploy failed after 3 attempts."
+          exit 1
