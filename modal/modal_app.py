@@ -2,32 +2,59 @@
 # Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal (production hardened)
 
 from __future__ import annotations
-import base64, io, json, os, time, pathlib
-from typing import TYPE_CHECKING, Optional
+
+import base64
+import io
+import json
+import os
+import time
+import uuid
+import pathlib
+from typing import Optional, Tuple
 
 import modal
 
-if TYPE_CHECKING:
-    from fastapi import Request
+# ── Optional runtime imports (local, fast) ────────────────────────────────────
+# We import Torch/Diffusers/PIL lazily where needed to keep import time low.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
 
-SDXL_INPAINT_ID     = os.getenv("SDXL_INPAINT_ID", "diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
+# Models
+SDXL_INPAINT_ID = os.getenv("SDXL_INPAINT_ID", "diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
 CONTROLNET_MODEL_ID = os.getenv("CONTROLNET_MODEL_ID", "diffusers/controlnet-sdxl-1.0-scribble")
-HF_CACHE_NAME       = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
-HF_CACHE_MOUNT      = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
-GPU_TYPE            = os.getenv("GPU_TYPE", "A10G")  # "A10G" | "A100" | "H100"
-API_KEY             = os.getenv("API_KEY", "")
-MAX_EDGE            = int(os.getenv("MAX_EDGE", "2048"))
-DEFAULT_STEPS       = int(os.getenv("STEPS", "28"))
-DEFAULT_GUIDANCE    = float(os.getenv("GUIDANCE", "5.5"))
-DEFAULT_SEED        = int(os.getenv("SEED", "0"))
+
+# Hugging Face cache on Modal NFS
+HF_CACHE_NAME = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
+HF_CACHE_MOUNT = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
+
+# GPU type per new Modal API (string; e.g., "A10G", "A100", "H100")
+GPU_TYPE = (os.getenv("GPU_TYPE") or "A10G").upper()
+if GPU_TYPE not in {"A10G", "A100", "H100"}:
+    GPU_TYPE = "A10G"
+
+# Auth
+API_KEY = os.getenv("API_KEY", "").strip()
+
+# Inference defaults
+MAX_EDGE = int(os.getenv("MAX_EDGE", "2048"))
+DEFAULT_STEPS = int(os.getenv("STEPS", "28"))
+DEFAULT_GUIDANCE = float(os.getenv("GUIDANCE", "5.5"))
+DEFAULT_SEED = int(os.getenv("SEED", "0"))
+
+# CORS (optional): set CORS_ORIGIN="*" or to your site origin
+CORS_ORIGIN = os.getenv("CORS_ORIGIN", "").strip()
 
 # Keep-warm mode persisted on NFS (survives container restarts)
-KEEPWARM_DIR  = os.path.join(HF_CACHE_MOUNT, "ssp")
+KEEPWARM_DIR = os.path.join(HF_CACHE_MOUNT, "ssp")
 KEEPWARM_FILE = os.path.join(KEEPWARM_DIR, "keepwarm_mode.txt")
-DEFAULT_MODE  = "business"  # business | dev | off
+DEFAULT_MODE = "business"  # business | dev | off
+
+# Optional Supabase upload
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", "")).strip()
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "ssp-outputs").strip()
+
 
 # ── Modal setup ───────────────────────────────────────────────────────────────
 app = modal.App(APP_NAME)
@@ -55,10 +82,147 @@ image = (
     .env({"HF_HOME": HF_CACHE_MOUNT})
 )
 
-# ── Model holder ─────────────────────────────────────────────────────────────
+# ── Shared function args ─────────────────────────────────────────────────────
+common_fn_args = dict(
+    image=image,
+    timeout=900,
+    gpu=GPU_TYPE,                                  # ✔ new Modal API — pass string
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE}  # ✔ correct NFS mapping
+)
+
+# ── Globals (lazy singletons inside container) ───────────────────────────────
 PIPE = None
 DETECTOR = None
+_SB = None  # Supabase client
 
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+def _json(data: dict, status: int = 200):
+    """Return JSON with optional CORS headers."""
+    from starlette.responses import JSONResponse
+    headers = {}
+    if CORS_ORIGIN:
+        headers.update({
+            "Access-Control-Allow-Origin": CORS_ORIGIN,
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, x-api-key",
+        })
+    return JSONResponse(content=data, status_code=status, headers=headers)
+
+
+def _ok(payload: dict, status: int = 200):
+    payload = {"ok": True, **payload}
+    return _json(payload, status=status)
+
+
+def _err(msg: str, code: str = "bad_request", status: int = 400):
+    return _json({"ok": False, "error": msg, "error_code": code}, status=status)
+
+
+def _check_api_key(hdrs) -> Optional[str]:
+    if not API_KEY:
+        return None
+    if hdrs.get("x-api-key") != API_KEY:
+        return "Unauthorized: bad or missing x-api-key"
+    return None
+
+
+def _ensure_keepwarm_dir():
+    pathlib.Path(KEEPWARM_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def _get_keepwarm_mode() -> str:
+    try:
+        with open(KEEPWARM_FILE, "r", encoding="utf-8") as f:
+            m = f.read().strip().lower()
+            return m if m in ("off", "dev", "business") else DEFAULT_MODE
+    except FileNotFoundError:
+        return DEFAULT_MODE
+
+
+def _set_keepwarm_mode(mode: str) -> str:
+    mode = (mode or "").lower()
+    if mode not in ("off", "dev", "business"):
+        mode = DEFAULT_MODE
+    _ensure_keepwarm_dir()
+    with open(KEEPWARM_FILE, "w", encoding="utf-8") as f:
+        f.write(mode)
+    return mode
+
+
+def _resize_long_edge(img, max_edge=2048):
+    from PIL import Image
+    w, h = img.size
+    if max(w, h) <= max_edge:
+        return img
+    scale = max_edge / max(w, h)
+    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+
+def _b64_jpeg(img, quality=92) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _sb_client():
+    """Lazy init Supabase client, if env provided."""
+    global _SB
+    if _SB is not None:
+        return _SB
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return None
+    from supabase import create_client
+    _SB = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _SB
+
+
+def _maybe_upload_jpeg(jpeg_bytes: bytes) -> Optional[str]:
+    """Upload to Supabase storage if configured; return public URL."""
+    sb = _sb_client()
+    if not sb:
+        return None
+    # path like: sdxl/2025-08-12/uuid.jpg
+    day = time.strftime("%Y-%m-%d")
+    key = f"sdxl/{day}/{uuid.uuid4().hex}.jpg"
+    try:
+        sb.storage.from_(SUPABASE_BUCKET).upload(key, jpeg_bytes, {"content-type": "image/jpeg", "upsert": "true"})
+        pub = sb.storage.from_(SUPABASE_BUCKET).get_public_url(key)
+        return pub
+    except Exception:
+        return None
+
+
+def _parse_payload_dict(raw: str) -> dict:
+    try:
+        return json.loads(raw or "{}")
+    except Exception:
+        return {"_raw": raw}
+
+
+def _norm_params(p: dict) -> Tuple[str, str, int, float, Optional[int], float, str, str]:
+    """Clamp and normalize user params."""
+    style = str(p.get("style", "modern"))
+    room = str(p.get("room", "living room"))
+
+    steps = int(p.get("steps", DEFAULT_STEPS))
+    steps = max(5, min(75, steps))
+
+    guidance = float(p.get("guidance", DEFAULT_GUIDANCE))
+    guidance = max(1.0, min(13.0, guidance))
+
+    seed = int(p.get("seed", DEFAULT_SEED)) or None
+
+    strength = float(p.get("strength", 0.85))
+    strength = max(0.0, min(1.0, strength))
+
+    negative = p.get("negative_prompt", "blurry, low quality, artifacts, watermark, deformed")
+    prompt = p.get("prompt") or f"{style} {room}, tasteful furniture, natural light, photo-realistic, 4k, professional interior photograph"
+
+    return style, room, steps, guidance, seed, strength, negative, prompt
+
+
+# ── Model loader ─────────────────────────────────────────────────────────────
 def _lazy_load():
     """Load SDXL Inpaint + ControlNet + detector once per container."""
     global PIPE, DETECTOR
@@ -71,7 +235,7 @@ def _lazy_load():
 
     controlnet = ControlNetModel.from_pretrained(
         CONTROLNET_MODEL_ID,
-        torch_dtype=torch.float16
+        torch_dtype=torch.float16,
     )
 
     PIPE = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
@@ -79,7 +243,7 @@ def _lazy_load():
         controlnet=controlnet,
         torch_dtype=torch.float16,
     )
-    # perf knobs
+    # performance knobs
     PIPE.enable_model_cpu_offload()
     PIPE.enable_vae_slicing()
     try:
@@ -90,133 +254,131 @@ def _lazy_load():
     DETECTOR = LineartDetector.from_pretrained("lllyasviel/Annotators")
     return PIPE, DETECTOR
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def _resize_long_edge(img, max_edge=2048):
-    from PIL import Image
-    w, h = img.size
-    if max(w, h) <= max_edge:
-        return img
-    scale = max_edge / max(w, h)
-    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-
-def _b64_jpeg(img, quality=92) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-def _check_api_key(hdrs) -> Optional[str]:
-    if not API_KEY:
-        return None
-    if hdrs.get("x-api-key") != API_KEY:
-        return "Unauthorized: bad or missing x-api-key"
-    return None
-
-# keep-warm state on NFS
-def _ensure_keepwarm_dir():
-    pathlib.Path(KEEPWARM_DIR).mkdir(parents=True, exist_ok=True)
-
-def _get_keepwarm_mode() -> str:
-    try:
-        with open(KEEPWARM_FILE, "r", encoding="utf-8") as f:
-            m = f.read().strip()
-            return m if m in ("off", "dev", "business") else DEFAULT_MODE
-    except FileNotFoundError:
-        return DEFAULT_MODE
-
-def _set_keepwarm_mode(mode: str) -> str:
-    mode = (mode or "").lower()
-    if mode not in ("off", "dev", "business"):
-        mode = DEFAULT_MODE
-    _ensure_keepwarm_dir()
-    with open(KEEPWARM_FILE, "w", encoding="utf-8") as f:
-        f.write(mode)
-    return mode
-
-# ── Shared function args ─────────────────────────────────────────────────────
-common_fn_args = dict(
-    image=image,
-    timeout=900,
-    gpu=GPU_TYPE,                                  # ✔ new Modal API — pass string
-    network_file_systems={HF_CACHE_MOUNT: HF_CACHE}# ✔ correct NFS mapping
-)
 
 # ── HTTP Endpoints ───────────────────────────────────────────────────────────
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="GET", label="health")
-async def health() -> dict:
-    return {
-        "ok": True,
+async def health():
+    return _ok({
         "app": APP_NAME,
         "models": {"sdxl_inpaint": SDXL_INPAINT_ID, "controlnet": CONTROLNET_MODEL_ID},
+        "gpu": GPU_TYPE,
         "keepwarm_mode": _get_keepwarm_mode(),
-    }
+        "cors_origin": CORS_ORIGIN or None,
+        "supabase": bool(SUPABASE_URL and SUPABASE_KEY),
+    })
+
 
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
-async def stage(request: "Request"):
+async def stage(request):
+    # API key
     err = _check_api_key(request.headers)
     if err:
-        return {"error": err}
+        return _err(err, code="unauthorized", status=401)
 
-    form = await request.form()
-    file = form.get("image")
-    if file is None:
-        return {"error": "Missing file field 'image' (multipart/form-data)"}
-    payload_raw = form.get("payload") or "{}"
-    try:
-        payload = json.loads(payload_raw)
-    except Exception:
-        payload = {"_raw": payload_raw}
+    ct = (request.headers.get("content-type") or "").lower()
 
-    style    = str(payload.get("style", "modern"))
-    room     = str(payload.get("room", "living room"))
-    steps    = int(payload.get("steps", DEFAULT_STEPS))
-    guidance = float(payload.get("guidance", DEFAULT_GUIDANCE))
-    seed     = int(payload.get("seed", DEFAULT_SEED)) or None
-    strength = float(payload.get("strength", 0.85))
-    negative = payload.get("negative_prompt", "blurry, low quality, artifacts, watermark, deformed")
-    prompt   = payload.get("prompt") or f"{style} {room}, tasteful furniture, natural light, photo-realistic, 4k, professional interior photograph"
+    # 1) JSON mode (image_base64 + payload)
+    if "application/json" in ct:
+        try:
+            body = await request.json()
+        except Exception:
+            raw = (await request.body() or b"").decode("utf-8", "ignore")
+            return _err("Invalid JSON body", code="invalid_json", status=400)
 
+        b64 = body.get("image_base64")
+        if not (isinstance(b64, str) and b64.strip()):
+            return _err("Missing 'image_base64' in JSON", code="missing_image", status=400)
+
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else _parse_payload_dict(body.get("payload", "{}"))
+        img_bytes: bytes
+        try:
+            img_bytes = base64.b64decode(b64.split(",")[-1], validate=False)
+        except Exception:
+            return _err("image_base64 is not valid base64", code="invalid_base64", status=400)
+
+    # 2) Multipart mode (file field 'image' + payload string/json)
+    else:
+        try:
+            form = await request.form()
+        except Exception:
+            return _err("Expected multipart/form-data or application/json", code="unsupported_media_type", status=415)
+
+        file = form.get("image")
+        if file is None:
+            return _err("Missing file field 'image' (multipart/form-data)", code="missing_image", status=400)
+        payload = _parse_payload_dict(form.get("payload") or "{}")
+        try:
+            img_bytes = await file.read()
+        except Exception:
+            return _err("Could not read uploaded file", code="read_error", status=400)
+
+    # Decode image
     from PIL import Image, UnidentifiedImageError
     try:
-        img_bytes = await file.read()
         base = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except UnidentifiedImageError:
-        return {"error": "Invalid image"}
+        return _err("Invalid image format", code="invalid_image", status=400)
     base = _resize_long_edge(base, MAX_EDGE)
 
+    # Normalize params
+    style, room, steps, guidance, seed, strength, negative, prompt = _norm_params(payload)
+
+    # Load models
     t0 = time.time()
-    pipe, detector = _lazy_load()
+    try:
+        pipe, detector = _lazy_load()
+    except Exception as e:
+        return _err(f"Model load failed: {e}", code="model_load_failed", status=503)
     load_s = time.time() - t0
 
+    # Preprocess
     t1 = time.time()
-    guide = detector(base)                      # grayscale guidance map
-    mask  = Image.new("L", base.size, 0)        # rely on ControlNet for staging
+    try:
+        guide = detector(base)  # grayscale guidance map
+    except Exception as e:
+        return _err(f"Preprocess failed: {e}", code="preprocess_failed", status=500)
+
+    from PIL import Image as _PILImage
+    mask = _PILImage.new("L", base.size, 0)  # rely on ControlNet for “staging”
     prep_s = time.time() - t1
 
+    # Inference
     import torch
-    gen = torch.Generator("cuda") if seed is not None else None
+    gen = torch.Generator(device="cuda") if seed is not None else None
     if seed is not None:
         gen.manual_seed(seed)
 
     t2 = time.time()
-    with torch.autocast("cuda"):
-        out = pipe(
-            prompt=prompt,
-            negative_prompt=negative,
-            image=base,
-            mask_image=mask,
-            control_image=guide,
-            guidance_scale=guidance,
-            num_inference_steps=steps,
-            generator=gen,
-            strength=strength,
-        ).images[0]
+    try:
+        with torch.autocast("cuda"):
+            out = pipe(
+                prompt=prompt,
+                negative_prompt=negative,
+                image=base,
+                mask_image=mask,
+                control_image=guide,
+                guidance_scale=guidance,
+                num_inference_steps=steps,
+                generator=gen,
+                strength=strength,
+            ).images[0]
+    except Exception as e:
+        return _err(f"Inference failed: {e}", code="inference_failed", status=500)
     infer_s = time.time() - t2
 
-    return {
-        "ok": True,
-        "output_base64": _b64_jpeg(out, quality=92),
+    # Encode / upload
+    jpeg_buf = io.BytesIO()
+    out.save(jpeg_buf, format="JPEG", quality=92, optimize=True)
+    jpeg_bytes = jpeg_buf.getvalue()
+    b64_out = base64.b64encode(jpeg_bytes).decode("ascii")
+    out_url = _maybe_upload_jpeg(jpeg_bytes)
+
+    return _ok({
+        "output_base64": b64_out,
+        "output_url": out_url,
+        "images": [b64_out],  # compatibility with clients that expect an array
         "timings": {
             "load_models_s": round(load_s, 3),
             "preprocess_s": round(prep_s, 3),
@@ -228,19 +390,25 @@ async def stage(request: "Request"):
             "seed": seed or 0, "strength": strength, "negative_prompt": negative,
             "prompt": prompt, "sdxl_inpaint": SDXL_INPAINT_ID, "controlnet": CONTROLNET_MODEL_ID,
         },
-    }
+    })
+
 
 # Force warm-up
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="GET", label="warm")
-async def warm() -> dict:
-    _lazy_load()
-    return {"ok": True, "warmed": True, "mode": _get_keepwarm_mode()}
+async def warm():
+    try:
+        _lazy_load()
+    except Exception as e:
+        return _err(f"Model load failed: {e}", code="model_load_failed", status=503)
+    return _ok({"warmed": True, "mode": _get_keepwarm_mode()})
+
 
 # NOTE: labels must be lowercase letters, numerals, and dashes.
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarm-set")
-async def keepwarm_set(request: "Request"):
+async def keepwarm_set(request):
+    # Accept mode via query, form, or JSON
     mode = (request.query_params.get("mode") or "").strip()
     if not mode:
         try:
@@ -257,18 +425,21 @@ async def keepwarm_set(request: "Request"):
         except Exception:
             pass
     mode = _set_keepwarm_mode(mode)
-    return {"ok": True, "mode": mode}
+    return _ok({"mode": mode})
+
 
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="GET", label="keepwarm-status")
-async def keepwarm_status() -> dict:
-    return {"ok": True, "mode": _get_keepwarm_mode()}
+async def keepwarm_status():
+    return _ok({"mode": _get_keepwarm_mode()})
 
-# Scheduled keep-warm (no web label; underscores are fine here)
+
+# Scheduled keep-warm (no web label)
 @app.function(schedule=modal.Period(seconds=300), image=image, network_file_systems={HF_CACHE_MOUNT: HF_CACHE})
 def keepwarm_cron():
     mode = _get_keepwarm_mode()
     if mode == "off":
         return {"ok": True, "skipped": True, "mode": mode}
+    # Touch the pipeline (lightweight)
     _lazy_load()
     return {"ok": True, "mode": mode}
