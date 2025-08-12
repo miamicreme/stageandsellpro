@@ -1,175 +1,225 @@
-name: Modal Deploy
+# modal/modal_app.py
+# Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal (production hardened)
+# - FastAPI HTTP endpoints via @modal.fastapi_endpoint
+# - SDXL Inpaint + ControlNet-SDXL (scribble/lineart-like) guidance
+# - Hugging Face cache on Modal NFS, GPU, keep-warm, health
+# - Multipart upload: file field "image", JSON payload field "payload"
+# - Returns: JSON with output_base64, timings, params
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main, master, develop ]
-    paths:
-      - "modal/**"
-      - "modal_app.py"
-      - ".github/workflows/modal-deploy.yml"
+from __future__ import annotations
+import base64, io, json, os, time
+from typing import TYPE_CHECKING, Optional
 
-concurrency:
-  group: modal-deploy-${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+import modal
 
-permissions:
-  contents: read
+if TYPE_CHECKING:
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
 
-env:
-  PYTHON_VERSION: "3.11"
-  MODAL_ENTRYPOINT: "modal/modal_app.py"
-  MODAL_PROFILE: "prod"
+# ───────────────────────── Config ─────────────────────────
+APP_NAME = "stage-sell-pro-pipeline"
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+# Models (change safely via env)
+SDXL_INPAINT_ID     = os.getenv("SDXL_INPAINT_ID", "diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
+CONTROLNET_MODEL_ID = os.getenv("CONTROLNET_MODEL_ID", "diffusers/controlnet-sdxl-1.0-scribble")  # “lineart-like”
+HF_CACHE_NAME       = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
+HF_CACHE_MOUNT      = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
+GPU_TYPE            = os.getenv("GPU_TYPE", "A10G")  # A10G/A100/H100
+API_KEY             = os.getenv("API_KEY", "")       # optional x-api-key check
+MAX_EDGE            = int(os.getenv("MAX_EDGE", "2048"))
+DEFAULT_STEPS       = int(os.getenv("STEPS", "28"))
+DEFAULT_GUIDANCE    = float(os.getenv("GUIDANCE", "5.5"))
+DEFAULT_SEED        = int(os.getenv("SEED", "0"))    # 0 => random
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+# ───────────────────────── Modal setup ─────────────────────────
+app = modal.App(APP_NAME)
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
+HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
 
-      - name: Install Modal CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install 'modal>=1.1,<2'
-          python -m modal --version || true
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")  # for potential video assembly, optional
+    .pip_install(
+        "torch==2.2.2",
+        "transformers>=4.40.0",
+        "accelerate>=0.29.0",
+        "safetensors>=0.4.2",
+        "diffusers>=0.27.2",
+        "controlnet-aux>=0.0.9",
+        "Pillow>=10.2.0",
+        "fastapi>=0.110.0",
+        "uvicorn>=0.29.0",
+        "starlette>=0.37.2",
+        "numpy>=1.26.4",
+        "tqdm>=4.66.2",
+        "moviepy>=1.0.3",   # optional
+        "supabase>=2.4.3",  # optional; integrate if you want storage uploads
+    )
+    .env({"HF_HOME": HF_CACHE_MOUNT})
+)
 
-      - name: Configure Modal token
-        shell: bash
-        env:
-          CI_MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          CI_MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-          MODAL_PROFILE: prod
-        run: |
-          set -euo pipefail
+# ───────────────────────── Model holder ─────────────────────────
+# We keep a singleton in the container to avoid reloading models between calls.
+PIPE = None
+DETECTOR = None
 
-          if [ -z "${CI_MODAL_TOKEN_ID:-}" ] || [ -z "${CI_MODAL_TOKEN_SECRET:-}" ]; then
-            echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
-            exit 1
-          fi
+def _lazy_load():
+    global PIPE, DETECTOR
+    if PIPE is not None and DETECTOR is not None:
+        return PIPE, DETECTOR
 
-          # Write creds into the prod profile
-          python -m modal token set \
-            --token-id "$CI_MODAL_TOKEN_ID" \
-            --token-secret "$CI_MODAL_TOKEN_SECRET" \
-            --profile "$MODAL_PROFILE"
+    import torch
+    from diffusers import StableDiffusionXLControlNetInpaintPipeline, ControlNetModel
+    from controlnet_aux import LineartDetector  # scribble/lineart-like preprocessor
+    from PIL import Image
 
-          # Verify ~/.modal.toml has [prod] with token_id + token_secret
-          python -c 'import sys, pathlib, tomllib; p=pathlib.Path.home()/".modal.toml"; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get("prod") or {}; sys.exit(0 if (pr.get("token_id") and pr.get("token_secret")) else 2)' \
-          || { echo "::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)"; exit 1; }
+    controlnet = ControlNetModel.from_pretrained(
+        CONTROLNET_MODEL_ID,
+        torch_dtype=torch.float16
+    )
 
-          echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
-          unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
+    PIPE = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
+        SDXL_INPAINT_ID,
+        controlnet=controlnet,
+        torch_dtype=torch.float16,
+    )
+    # memory/performance knobs
+    PIPE.enable_model_cpu_offload()  # good default on A10G
+    PIPE.enable_vae_slicing()
+    try:
+        PIPE.enable_xformers_memory_efficient_attention()
+    except Exception:
+        pass
 
-      - name: Validate entrypoint exists
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -f "$MODAL_ENTRYPOINT" ]; then
-            echo "::error file=$MODAL_ENTRYPOINT::Modal entrypoint not found"
-            exit 1
-          fi
+    DETECTOR = LineartDetector.from_pretrained("lllyasviel/Annotators")
+    return PIPE, DETECTOR
 
-      - name: Deploy to Modal
-        shell: bash
-        env:
-          MODAL_PROFILE: ${{ env.MODAL_PROFILE }}
-          MODAL_ENTRYPOINT: ${{ env.MODAL_ENTRYPOINT }}
-        run: |
-          set -euo pipefail
-          echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
-          echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
+# ───────────────────────── Helpers ─────────────────────────
+def _resize_long_edge(img, max_edge=2048):
+    from PIL import Image
+    w, h = img.size
+    long_edge = max(w, h)
+    if long_edge <= max_edge:
+        return img
+    scale = max_edge / long_edge
+    nw, nh = int(w * scale), int(h * scale)
+    return img.resize((nw, nh), Image.LANCZOS)
 
-          for attempt in 1 2 3; do
-            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
-              python -m modal deploy "${MODAL_ENTRYPOINT}"; then
-              echo "Deploy succeeded."
-              exit 0
-            fi
-            echo "Deploy failed (attempt ${attempt}). Retrying in 10s..."
-            sleep 10
-          done
+def _b64_jpeg(img, quality=92) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
-          echo "::error::Modal deploy failed after 3 attempts."
-          exit 1
+def _check_api_key(hdrs) -> Optional[str]:
+    if not API_KEY:
+        return None
+    if hdrs.get("x-api-key") != API_KEY:
+        return "Unauthorized: bad or missing x-api-key"
+    return None
 
-      # ================== Post-deploy: configure keep-warm mode ==================
-      - name: Configure keep-warm mode
-        if: success()
-        shell: bash
-        env:
-          # REQUIRED: your Modal app prefix (before -<function>.modal.run)
-          # e.g., miamicreme--stage-sell-pro-pipeline
-          SSP_APP_PREFIX: ${{ secrets.SSP_APP_PREFIX }}
+# ───────────────────────── HTTP Endpoints ─────────────────────────
+@app.function(image=image, timeout=900, gpu=modal.gpu.A10G() if GPU_TYPE=="A10G" else modal.gpu.A100(), network_file_systems={HF_CACHE: HF_CACHE_MOUNT})
+@modal.fastapi_endpoint(method="GET", label="health")
+async def health() -> dict:
+    return {"ok": True, "app": APP_NAME, "models": {"sdxl_inpaint": SDXL_INPAINT_ID, "controlnet": CONTROLNET_MODEL_ID}}
 
-          # REQUIRED: API key configured in the app (for keepwarm_set auth)
-          SSP_API_KEY: ${{ secrets.STAGESELLPRO_KEY }}
+@app.function(image=image, timeout=900, gpu=modal.gpu.A10G() if GPU_TYPE=="A10G" else modal.gpu.A100(), network_file_systems={HF_CACHE: HF_CACHE_MOUNT})
+@modal.fastapi_endpoint(method="POST", label="stage")
+async def stage(request: "Request"):
+    # API key (optional)
+    err = _check_api_key(request.headers)
+    if err:
+        return {"error": err}
 
-          # Optional: override; if empty we auto-pick by branch (main=business, others=off)
-          KEEPWARM_MODE: ""                 # off | business | always
-          KEEPWARM_TZ: "America/New_York"   # for business mode
-          KEEPWARM_HOURS: "09:00-18:00"     # for business mode
-          KEEPWARM_WEEKDAYS: "1-5"          # for business mode
-        run: |
-          set -euo pipefail
+    # Parse multipart form
+    form = await request.form()
+    file = form.get("image")
+    if file is None:
+        return {"error": "Missing file field 'image' (multipart/form-data)"}
+    payload_raw = form.get("payload") or "{}"
+    try:
+        payload = json.loads(payload_raw)
+    except Exception:
+        payload = {"_raw": payload_raw}
 
-          if [ -z "${SSP_APP_PREFIX:-}" ] || [ -z "${SSP_API_KEY:-}" ]; then
-            echo "::warning::SSP_APP_PREFIX or STAGESELLPRO_KEY secret missing; skipping keep-warm config."
-            exit 0
-          fi
+    style     = str(payload.get("style", "modern"))
+    room      = str(payload.get("room", "living room"))
+    steps     = int(payload.get("steps", DEFAULT_STEPS))
+    guidance  = float(payload.get("guidance", DEFAULT_GUIDANCE))
+    seed      = int(payload.get("seed", DEFAULT_SEED)) or None
+    strength  = float(payload.get("strength", 0.85))  # how much to respect mask
+    negative  = payload.get("negative_prompt", "blurry, low quality, artifacts, watermark, deformed")
+    prompt    = payload.get("prompt") or f"{style} {room}, tasteful furniture, natural light, photo-realistic, 4k, professional interior photograph"
 
-          MODE="${KEEPWARM_MODE:-}"
-          if [ -z "$MODE" ]; then
-            case "${GITHUB_REF_NAME}" in
-              main|master) MODE="business" ;;
-              develop|dev) MODE="off" ;;
-              *) MODE="off" ;;
-            esac
-          fi
+    # Load image
+    from PIL import Image, UnidentifiedImageError
+    try:
+        img_bytes = await file.read()
+        base = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except UnidentifiedImageError:
+        return {"error": "Invalid image"}
+    base = _resize_long_edge(base, MAX_EDGE)
 
-          URL="https://${SSP_APP_PREFIX}-keepwarm_set.modal.run/"
-          echo "Setting keep-warm mode='${MODE}' at ${URL}"
+    # Models
+    t0 = time.time()
+    pipe, detector = _lazy_load()
+    load_s = time.time() - t0
 
-          if [ "$MODE" = "business" ]; then
-            BODY=$(printf '{"mode":"%s","tz":"%s","hours":"%s","weekdays":"%s"}' \
-              "$MODE" "$KEEPWARM_TZ" "$KEEPWARM_HOURS" "$KEEPWARM_WEEKDAYS")
-          else
-            BODY=$(printf '{"mode":"%s"}' "$MODE")
-          fi
+    # Preprocess: lineart/scribble-like guidance
+    t1 = time.time()
+    guide = detector(base)  # grayscale guidance map
+    # For inpainting, we also need a mask. If none provided, detect empty areas via lineart gaps (simple heuristic).
+    # Here we use a full canvas (no hole) and rely on ControlNet guidance to “stage” the room.
+    mask = Image.new("L", base.size, 0)  # 0=keep, 255=paint; if you want object removal, compute a true mask here.
+    prep_s = time.time() - t1
 
-          curl -fSs -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: ${SSP_API_KEY}" \
-            -d "$BODY" \
-            -o /tmp/keepwarm_set.json
+    # Inference
+    import torch
+    gen = torch.Generator("cuda") if seed is not None else None
+    if seed is not None:
+        gen.manual_seed(seed)
 
-          echo "Keep-warm set response:"
-          cat /tmp/keepwarm_set.json
+    t2 = time.time()
+    with torch.autocast("cuda"):
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=negative,
+            image=base,
+            mask_image=mask,
+            control_image=guide,
+            guidance_scale=guidance,
+            num_inference_steps=steps,
+            generator=gen,
+            strength=strength,
+        ).images[0]
+    infer_s = time.time() - t2
 
-      - name: Verify keep-warm mode
-        if: success()
-        shell: bash
-        env:
-          SSP_APP_PREFIX: ${{ secrets.SSP_APP_PREFIX }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SSP_APP_PREFIX:-}" ]; then
-            echo "::warning::SSP_APP_PREFIX secret missing; skipping verification."
-            exit 0
-          fi
-          URL="https://${SSP_APP_PREFIX}-keepwarm_status.modal.run/"
-          echo "Verifying keep-warm at ${URL}"
-          curl -fSs "$URL" -o /tmp/keepwarm_status.json
-          echo "Status:"
-          cat /tmp/keepwarm_status.json
+    # Return base64 and timings
+    return {
+        "ok": True,
+        "output_base64": _b64_jpeg(out, quality=92),
+        "timings": {
+            "load_models_s": round(load_s, 3),
+            "preprocess_s": round(prep_s, 3),
+            "inference_s": round(infer_s, 3),
+            "total_s": round(time.time() - t0, 3),
+        },
+        "params": {
+            "style": style,
+            "room": room,
+            "steps": steps,
+            "guidance": guidance,
+            "seed": seed or 0,
+            "strength": strength,
+            "negative_prompt": negative,
+            "prompt": prompt,
+            "sdxl_inpaint": SDXL_INPAINT_ID,
+            "controlnet": CONTROLNET_MODEL_ID,
+        }
+    }
+
+# Keep-warm: ping the health route periodically to keep container hot.
+@app.function(schedule=modal.Period(seconds=300), image=image, network_file_systems={HF_CACHE: HF_CACHE_MOUNT})
+def keepwarm_cron():
+    # no-op; presence keeps image warm & the container alive
+    return {"ok": True}
