@@ -2,7 +2,7 @@
 # Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal (production hardened)
 
 from __future__ import annotations
-import base64, io, json, os, time
+import base64, io, json, os, time, pathlib
 from typing import TYPE_CHECKING, Optional
 
 import modal
@@ -13,21 +13,24 @@ if TYPE_CHECKING:
 # ───────────────────────── Config ─────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
 
-# Models
 SDXL_INPAINT_ID     = os.getenv("SDXL_INPAINT_ID", "diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
-CONTROLNET_MODEL_ID = os.getenv("CONTROLNET_MODEL_ID", "diffusers/controlnet-sdxl-1.0-scribble")  # lineart/scribble-like
+CONTROLNET_MODEL_ID = os.getenv("CONTROLNET_MODEL_ID", "diffusers/controlnet-sdxl-1.0-scribble")
 HF_CACHE_NAME       = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
 HF_CACHE_MOUNT      = os.getenv("HF_CACHE_MOUNT", "/root/.cache/huggingface")
-GPU_TYPE            = os.getenv("GPU_TYPE", "A10G")  # use strings: "A10G", "A100", "H100"
+GPU_TYPE            = os.getenv("GPU_TYPE", "A10G")  # "A10G" | "A100" | "H100"
 API_KEY             = os.getenv("API_KEY", "")
 MAX_EDGE            = int(os.getenv("MAX_EDGE", "2048"))
 DEFAULT_STEPS       = int(os.getenv("STEPS", "28"))
 DEFAULT_GUIDANCE    = float(os.getenv("GUIDANCE", "5.5"))
 DEFAULT_SEED        = int(os.getenv("SEED", "0"))
 
+# Keep-warm mode persistence (on NFS so CI calls survive container restarts)
+KEEPWARM_DIR  = os.path.join(HF_CACHE_MOUNT, "ssp")
+KEEPWARM_FILE = os.path.join(KEEPWARM_DIR, "keepwarm_mode.txt")
+DEFAULT_MODE  = "business"  # business | dev | off
+
 # ───────────────────────── Modal setup ─────────────────────────
 app = modal.App(APP_NAME)
-
 HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
 
 image = (
@@ -57,7 +60,7 @@ PIPE = None
 DETECTOR = None
 
 def _lazy_load():
-    """Load SDXL Inpaint + ControlNet and the lineart detector once per container."""
+    """Load SDXL Inpaint + ControlNet + detector once per container."""
     global PIPE, DETECTOR
     if PIPE is not None and DETECTOR is not None:
         return PIPE, DETECTOR
@@ -76,7 +79,7 @@ def _lazy_load():
         controlnet=controlnet,
         torch_dtype=torch.float16,
     )
-    # perf
+    # performance knobs
     PIPE.enable_model_cpu_offload()
     PIPE.enable_vae_slicing()
     try:
@@ -108,16 +111,36 @@ def _check_api_key(hdrs) -> Optional[str]:
         return "Unauthorized: bad or missing x-api-key"
     return None
 
-# ───────────────────────── HTTP Endpoints ─────────────────────────
-# FIX 1: new GPU API — pass a STRING (e.g., "A10G")
-# FIX 2: NFS mapping is {mount_path: nfs_obj}, not {nfs_obj: mount_path}
+# keep-warm state
+def _ensure_keepwarm_dir():
+    pathlib.Path(KEEPWARM_DIR).mkdir(parents=True, exist_ok=True)
+
+def _get_keepwarm_mode() -> str:
+    try:
+        with open(KEEPWARM_FILE, "r", encoding="utf-8") as f:
+            m = f.read().strip()
+            return m if m in ("off", "dev", "business") else DEFAULT_MODE
+    except FileNotFoundError:
+        return DEFAULT_MODE
+
+def _set_keepwarm_mode(mode: str) -> str:
+    mode = (mode or "").lower()
+    if mode not in ("off", "dev", "business"):
+        mode = DEFAULT_MODE
+    _ensure_keepwarm_dir()
+    with open(KEEPWARM_FILE, "w", encoding="utf-8") as f:
+        f.write(mode)
+    return mode
+
+# ───────────────────────── Common function args ─────────────────────────
 common_fn_args = dict(
     image=image,
     timeout=900,
-    gpu=GPU_TYPE,
-    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
+    gpu=GPU_TYPE,                                  # ✔ new API: string
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE}# ✔ correct mapping
 )
 
+# ───────────────────────── HTTP Endpoints ─────────────────────────
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="GET", label="health")
 async def health() -> dict:
@@ -125,17 +148,16 @@ async def health() -> dict:
         "ok": True,
         "app": APP_NAME,
         "models": {"sdxl_inpaint": SDXL_INPAINT_ID, "controlnet": CONTROLNET_MODEL_ID},
+        "keepwarm_mode": _get_keepwarm_mode(),
     }
 
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
 async def stage(request: "Request"):
-    # API key check (optional)
     err = _check_api_key(request.headers)
     if err:
         return {"error": err}
 
-    # Parse multipart
     form = await request.form()
     file = form.get("image")
     if file is None:
@@ -155,7 +177,6 @@ async def stage(request: "Request"):
     negative = payload.get("negative_prompt", "blurry, low quality, artifacts, watermark, deformed")
     prompt   = payload.get("prompt") or f"{style} {room}, tasteful furniture, natural light, photo-realistic, 4k, professional interior photograph"
 
-    # Load image
     from PIL import Image, UnidentifiedImageError
     try:
         img_bytes = await file.read()
@@ -164,18 +185,15 @@ async def stage(request: "Request"):
         return {"error": "Invalid image"}
     base = _resize_long_edge(base, MAX_EDGE)
 
-    # Load models
     t0 = time.time()
     pipe, detector = _lazy_load()
     load_s = time.time() - t0
 
-    # Preprocess — lineart guidance map
     t1 = time.time()
-    guide = detector(base)  # grayscale
-    mask = Image.new("L", base.size, 0)  # 0=keep, 255=paint; here we rely on ControlNet for “staging”
+    guide = detector(base)                      # grayscale guidance
+    mask  = Image.new("L", base.size, 0)        # rely on ControlNet for staging
     prep_s = time.time() - t1
 
-    # Inference
     import torch
     gen = torch.Generator("cuda") if seed is not None else None
     if seed is not None:
@@ -212,7 +230,48 @@ async def stage(request: "Request"):
         },
     }
 
-# Keep-warm (no GPU needed)
+# Force a warm-up (useful for one-off pings)
+@app.function(**common_fn_args)
+@modal.fastapi_endpoint(method="GET", label="warm")
+async def warm() -> dict:
+    _lazy_load()
+    return {"ok": True, "warmed": True, "mode": _get_keepwarm_mode()}
+
+# Keep-warm mode setters that your CI expects
+@app.function(**common_fn_args)
+@modal.fastapi_endpoint(method="POST", label="keepwarm_set")
+async def keepwarm_set(request: "Request"):
+    # Accept mode via query, form, or JSON
+    mode = (request.query_params.get("mode") or "").strip()
+    if not mode:
+        # try form
+        try:
+            form = await request.form()
+            mode = (form.get("mode") or "").strip()
+        except Exception:
+            mode = ""
+    if not mode:
+        try:
+            body = await request.body()
+            if body:
+                data = json.loads(body.decode("utf-8"))
+                mode = (data.get("mode") or "").strip()
+        except Exception:
+            pass
+    mode = _set_keepwarm_mode(mode)
+    return {"ok": True, "mode": mode}
+
+@app.function(**common_fn_args)
+@modal.fastapi_endpoint(method="GET", label="keepwarm_status")
+async def keepwarm_status() -> dict:
+    return {"ok": True, "mode": _get_keepwarm_mode()}
+
+# Scheduled ping (respects mode)
 @app.function(schedule=modal.Period(seconds=300), image=image, network_file_systems={HF_CACHE_MOUNT: HF_CACHE})
 def keepwarm_cron():
-    return {"ok": True}
+    mode = _get_keepwarm_mode()
+    if mode == "off":
+        return {"ok": True, "skipped": True, "mode": mode}
+    # Touch the pipeline (lightweight)
+    _lazy_load()
+    return {"ok": True, "mode": mode}
