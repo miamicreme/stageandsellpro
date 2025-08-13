@@ -12,8 +12,7 @@ import pathlib
 from typing import Optional, Tuple
 
 import modal
-from fastapi import Request  # <-- IMPORTANT: explicit import for request typing
-
+from fastapi import Request  # explicit import for request typing
 
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
@@ -63,7 +62,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", "")).strip()
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "ssp-outputs").strip()
 
-
 # ── Modal setup ───────────────────────────────────────────────────────────────
 app = modal.App(APP_NAME)
 HF_CACHE = modal.NetworkFileSystem.from_name(HF_CACHE_NAME, create_if_missing=True)
@@ -94,7 +92,7 @@ image = (
 gpu_fn_args = dict(
     image=image,
     timeout=900,
-    gpu=GPU_TYPE,                                   # ✔ new Modal API — pass string
+    gpu=GPU_TYPE,                                   # ✔ pass string per new API
     network_file_systems={HF_CACHE_MOUNT: HF_CACHE} # ✔ correct NFS mapping
 )
 cpu_fn_args = dict(
@@ -103,12 +101,10 @@ cpu_fn_args = dict(
     network_file_systems={HF_CACHE_MOUNT: HF_CACHE}
 )
 
-
 # ── Globals (lazy singletons inside container) ───────────────────────────────
 PIPE = None
 DETECTOR = None
 _SB = None  # Supabase client
-
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 def _json(data: dict, status: int = 200):
@@ -211,7 +207,6 @@ def _norm_params(p: dict) -> Tuple[str, str, int, float, Optional[int], float, s
     prompt = p.get("prompt") or f"{style} {room}, tasteful furniture, natural light, photo-realistic, 4k, professional interior photograph"
     return style, room, steps, guidance, seed, strength, negative, prompt
 
-
 # ── Model loader ─────────────────────────────────────────────────────────────
 def _lazy_load():
     """Load SDXL Inpaint + ControlNet + detector once per container."""
@@ -244,7 +239,6 @@ def _lazy_load():
     DETECTOR = LineartDetector.from_pretrained("lllyasviel/Annotators")
     return PIPE, DETECTOR
 
-
 # ── HTTP Endpoints ───────────────────────────────────────────────────────────
 # CPU-only admin endpoints (no GPU reserved)
 @app.function(**cpu_fn_args)
@@ -274,7 +268,7 @@ async def warm():
 # NOTE: labels must be lowercase letters, numerals, and dashes.
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarm-set")
-async def keepwarm_set(request: Request):  # <-- typed
+async def keepwarm_set(request: Request):
     mode = (request.query_params.get("mode") or "").strip()
 
     if not mode:
@@ -299,7 +293,7 @@ async def keepwarm_set(request: Request):  # <-- typed
 # Extra alias without dash to make CI typos harmless (URL: /keepwarmset)
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarmset")
-async def keepwarmset(request: Request):  # <-- typed
+async def keepwarmset(request: Request):
     return await keepwarm_set(request)
 
 @app.function(**cpu_fn_args)
@@ -307,22 +301,20 @@ async def keepwarmset(request: Request):  # <-- typed
 async def keepwarm_status():
     return _ok({"mode": _get_keepwarm_mode()})
 
-
 # GPU-backed inference endpoints
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
-async def stage(request: Request):  # <-- typed
+async def stage(request: Request):
     return await _stage_impl(request)
 
 # Pretty label alias (use this as "/" on your custom domain)
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stagesellpro")
-async def stagesellpro(request: Request):  # <-- typed
+async def stagesellpro(request: Request):
     return await _stage_impl(request)
 
-
 # Shared implementation
-async def _stage_impl(request: Request):  # <-- typed
+async def _stage_impl(request: Request):
     # API key
     err = _check_api_key(request.headers)
     if err:
@@ -441,7 +433,6 @@ async def _stage_impl(request: Request):  # <-- typed
             "prompt": prompt, "sdxl_inpaint": SDXL_INPAINT_ID, "controlnet": CONTROLNET_MODEL_ID,
         },
     })
-
 
 # Scheduled keep-warm — slower & safe by default (CPU)
 @app.function(schedule=modal.Period(seconds=KEEPWARM_PERIOD_SEC), **cpu_fn_args)
