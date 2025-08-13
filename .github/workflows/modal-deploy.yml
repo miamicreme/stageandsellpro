@@ -1,5 +1,4 @@
 name: Modal Deploy
-
 on:
   workflow_dispatch:
   push:
