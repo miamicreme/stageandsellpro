@@ -32,6 +32,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Guard against underscore Modal URLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R --line-number 'keepwarm_set\.modal\.run' .; then
+            echo "::error::Found invalid underscore URL '...keepwarm_set.modal.run'. Use '...keepwarm-set.modal.run' (dashes) or alias '...keepwarmset.modal.run'."
+            exit 1
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -66,8 +75,18 @@ jobs:
             --profile "$MODAL_PROFILE"
 
           # Verify ~/.modal.toml has [prod] with token_id + token_secret
-          python -c 'import sys, pathlib, tomllib; p=pathlib.Path.home()/".modal.toml"; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get("prod") or {}; sys.exit(0 if (pr.get("token_id") and pr.get("token_secret")) else 2)' \
-          || { echo "::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)"; exit 1; }
+          python - << 'PY'
+import sys, pathlib, tomllib
+p = pathlib.Path.home()/".modal.toml"
+d = tomllib.loads(p.read_text()) if p.exists() else {}
+pr = d.get("prod") or {}
+ok = bool(pr.get("token_id") and pr.get("token_secret"))
+sys.exit(0 if ok else 2)
+PY
+          if [ $? -ne 0 ]; then
+            echo "::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)"
+            exit 1
+          fi
 
           echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
           unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
@@ -109,26 +128,38 @@ jobs:
         if: success()
         shell: bash
         env:
-          # REQUIRED: your Modal app prefix (before -<function>.modal.run)
-          # e.g., miamicreme--stage-sell-pro-pipeline
+          # Preferred: your Modal account subdomain (e.g., "miamicreme")
+          SSP_ACCOUNT: ${{ secrets.SSP_ACCOUNT }}
+          # Back-compat (if you previously stored this): must also be just "miamicreme"
           SSP_APP_PREFIX: ${{ secrets.SSP_APP_PREFIX }}
 
-          # REQUIRED: API key configured in the app (for keepwarm_set auth)
+          # Optional API key (not required by keepwarm-set in code, but harmless if present)
           SSP_API_KEY: ${{ secrets.STAGESELLPRO_KEY }}
 
-          # Optional: override; if empty we auto-pick by branch (main=business, others=off)
-          KEEPWARM_MODE: ""                 # off | business | always
-          KEEPWARM_TZ: "America/New_York"   # for business mode
-          KEEPWARM_HOURS: "09:00-18:00"     # for business mode
-          KEEPWARM_WEEKDAYS: "1-5"          # for business mode
+          # Optional overrides; if empty we auto-pick by branch (main/master=business, others=off)
+          KEEPWARM_MODE: ""               # off | dev | business
+          KEEPWARM_TZ: "America/New_York" # (reserved for future; ignored by server today)
+          KEEPWARM_HOURS: "09:00-18:00"   # (reserved)
+          KEEPWARM_WEEKDAYS: "1-5"        # (reserved)
         run: |
           set -euo pipefail
 
-          if [ -z "${SSP_APP_PREFIX:-}" ] || [ -z "${SSP_API_KEY:-}" ]; then
-            echo "::warning::SSP_APP_PREFIX or STAGESELLPRO_KEY secret missing; skipping keep-warm config."
+          # Resolve account slug (no "--", no underscores)
+          ACC="${SSP_ACCOUNT:-${SSP_APP_PREFIX:-}}"
+          if [ -z "${ACC}" ]; then
+            echo "::warning::SSP_ACCOUNT/SSP_APP_PREFIX not provided; skipping keep-warm config."
             exit 0
           fi
+          if [[ "${ACC}" == *"--"* ]]; then
+            echo "::error::SSP_ACCOUNT/SSP_APP_PREFIX should be just the account slug (e.g., 'miamicreme'), not include '--'."
+            exit 1
+          fi
+          if [[ "${ACC}" == *"_"* ]]; then
+            echo "::error::SSP_ACCOUNT/SSP_APP_PREFIX must not contain underscores."
+            exit 1
+          fi
 
+          # Determine mode
           MODE="${KEEPWARM_MODE:-}"
           if [ -z "$MODE" ]; then
             case "${GITHUB_REF_NAME}" in
@@ -137,39 +168,58 @@ jobs:
               *) MODE="off" ;;
             esac
           fi
+          case "$MODE" in
+            off|dev|business) ;;
+            *) echo "::warning::Invalid KEEPWARM_MODE='$MODE'; defaulting to 'off'."; MODE="off" ;;
+          esac
 
-          URL="https://${SSP_APP_PREFIX}-keepwarm_set.modal.run/"
-          echo "Setting keep-warm mode='${MODE}' at ${URL}"
+          URL_DASH="https://${ACC}--keepwarm-set.modal.run"
+          URL_ALIAS="https://${ACC}--keepwarmset.modal.run"
 
-          if [ "$MODE" = "business" ]; then
-            BODY=$(printf '{"mode":"%s","tz":"%s","hours":"%s","weekdays":"%s"}' \
-              "$MODE" "$KEEPWARM_TZ" "$KEEPWARM_HOURS" "$KEEPWARM_WEEKDAYS")
-          else
-            BODY=$(printf '{"mode":"%s"}' "$MODE")
+          echo "Setting keep-warm mode='${MODE}' at ${URL_DASH}"
+          BODY=$(printf '{"mode":"%s"}' "$MODE")
+
+          # Prepare headers
+          H_API=()
+          if [ -n "${SSP_API_KEY:-}" ]; then
+            H_API=(-H "x-api-key: ${SSP_API_KEY}")
           fi
 
-          curl -fSs -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "x-api-key: ${SSP_API_KEY}" \
-            -d "$BODY" \
-            -o /tmp/keepwarm_set.json
+          code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${URL_DASH}" \
+                  -H "Content-Type: application/json" "${H_API[@]}" \
+                  -d "$BODY")
+          if [ "$code" -ge 400 ]; then
+            echo "Dashed endpoint returned HTTP $code. Trying alias ${URL_ALIAS} ..."
+            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${URL_ALIAS}" \
+                    -H "Content-Type: application/json" "${H_API[@]}" \
+                    -d "$BODY")
+            if [ "$code" -ge 400 ]; then
+              echo "::error::keep-warm set failed with HTTP $code"
+              cat /tmp/keepwarm_set.json || true
+              exit 1
+            fi
+          fi
 
           echo "Keep-warm set response:"
-          cat /tmp/keepwarm_set.json
+          cat /tmp/keepwarm_set.json || true
 
       - name: Verify keep-warm mode
         if: success()
         shell: bash
         env:
+          SSP_ACCOUNT: ${{ secrets.SSP_ACCOUNT }}
           SSP_APP_PREFIX: ${{ secrets.SSP_APP_PREFIX }}
         run: |
           set -euo pipefail
-          if [ -z "${SSP_APP_PREFIX:-}" ]; then
-            echo "::warning::SSP_APP_PREFIX secret missing; skipping verification."
+
+          ACC="${SSP_ACCOUNT:-${SSP_APP_PREFIX:-}}"
+          if [ -z "${ACC}" ]; then
+            echo "::warning::SSP_ACCOUNT/SSP_APP_PREFIX not provided; skipping verification."
             exit 0
           fi
-          URL="https://${SSP_APP_PREFIX}-keepwarm_status.modal.run/"
-          echo "Verifying keep-warm at ${URL}"
-          curl -fSs "$URL" -o /tmp/keepwarm_status.json
+
+          URL_STATUS="https://${ACC}--keepwarm-status.modal.run"
+          echo "Verifying keep-warm at ${URL_STATUS}"
+          curl -fSs "$URL_STATUS" -o /tmp/keepwarm_status.json
           echo "Status:"
           cat /tmp/keepwarm_status.json
