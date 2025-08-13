@@ -1,7 +1,6 @@
 # modal/modal_app.py
-# Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal (production hardened, credit-friendly)
-
-from __future__ import annotations
+# Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal
+# (production hardened, credit-friendly)
 
 import base64
 import io
@@ -13,13 +12,21 @@ import pathlib
 from typing import Optional, Tuple
 
 import modal
+from fastapi import Request  # <-- IMPORTANT: explicit import for request typing
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
 
 # Models
-SDXL_INPAINT_ID = os.getenv("SDXL_INPAINT_ID", "diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
-CONTROLNET_MODEL_ID = os.getenv("CONTROLNET_MODEL_ID", "diffusers/controlnet-sdxl-1.0-scribble")
+SDXL_INPAINT_ID = os.getenv(
+    "SDXL_INPAINT_ID",
+    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+)
+CONTROLNET_MODEL_ID = os.getenv(
+    "CONTROLNET_MODEL_ID",
+    "diffusers/controlnet-sdxl-1.0-scribble",
+)
 
 # Hugging Face cache on Modal NFS
 HF_CACHE_NAME = os.getenv("HF_CACHE_NAME", "ssp-hf-cache")
@@ -55,6 +62,7 @@ KEEPWARM_PERIOD_SEC = int(os.getenv("KEEPWARM_PERIOD_SEC", "1800"))  # default: 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", "")).strip()
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "ssp-outputs").strip()
+
 
 # ── Modal setup ───────────────────────────────────────────────────────────────
 app = modal.App(APP_NAME)
@@ -95,10 +103,12 @@ cpu_fn_args = dict(
     network_file_systems={HF_CACHE_MOUNT: HF_CACHE}
 )
 
+
 # ── Globals (lazy singletons inside container) ───────────────────────────────
 PIPE = None
 DETECTOR = None
 _SB = None  # Supabase client
+
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 def _json(data: dict, status: int = 200):
@@ -156,7 +166,7 @@ def _resize_long_edge(img, max_edge=2048):
 
 def _b64_jpeg(img, quality=92) -> str:
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92, optimize=True)
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 def _sb_client():
@@ -176,7 +186,10 @@ def _maybe_upload_jpeg(jpeg_bytes: bytes) -> Optional[str]:
     day = time.strftime("%Y-%m-%d")
     key = f"sdxl/{day}/{uuid.uuid4().hex}.jpg"
     try:
-        sb.storage.from_(SUPABASE_BUCKET).upload(key, jpeg_bytes, {"content-type": "image/jpeg", "upsert": "true"})
+        sb.storage.from_(SUPABASE_BUCKET).upload(
+            key, jpeg_bytes,
+            {"content-type": "image/jpeg", "upsert": "true"}
+        )
         return sb.storage.from_(SUPABASE_BUCKET).get_public_url(key)
     except Exception:
         return None
@@ -197,6 +210,7 @@ def _norm_params(p: dict) -> Tuple[str, str, int, float, Optional[int], float, s
     negative = p.get("negative_prompt", "blurry, low quality, artifacts, watermark, deformed")
     prompt = p.get("prompt") or f"{style} {room}, tasteful furniture, natural light, photo-realistic, 4k, professional interior photograph"
     return style, room, steps, guidance, seed, strength, negative, prompt
+
 
 # ── Model loader ─────────────────────────────────────────────────────────────
 def _lazy_load():
@@ -230,6 +244,7 @@ def _lazy_load():
     DETECTOR = LineartDetector.from_pretrained("lllyasviel/Annotators")
     return PIPE, DETECTOR
 
+
 # ── HTTP Endpoints ───────────────────────────────────────────────────────────
 # CPU-only admin endpoints (no GPU reserved)
 @app.function(**cpu_fn_args)
@@ -237,7 +252,10 @@ def _lazy_load():
 async def health():
     return _ok({
         "app": APP_NAME,
-        "models": {"sdxl_inpaint": SDXL_INPAINT_ID, "controlnet": CONTROLNET_MODEL_ID},
+        "models": {
+            "sdxl_inpaint": SDXL_INPAINT_ID,
+            "controlnet": CONTROLNET_MODEL_ID,
+        },
         "gpu": GPU_TYPE,
         "keepwarm_mode": _get_keepwarm_mode(),
         "cors_origin": CORS_ORIGIN or None,
@@ -253,16 +271,19 @@ async def warm():
         return _err(f"Model load failed: {e}", code="model_load_failed", status=503)
     return _ok({"warmed": True, "mode": _get_keepwarm_mode()})
 
+# NOTE: labels must be lowercase letters, numerals, and dashes.
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarm-set")
-async def keepwarm_set(request):
+async def keepwarm_set(request: Request):  # <-- typed
     mode = (request.query_params.get("mode") or "").strip()
+
     if not mode:
         try:
             form = await request.form()
             mode = (form.get("mode") or "").strip()
         except Exception:
             mode = ""
+
     if not mode:
         try:
             body = await request.body()
@@ -271,13 +292,14 @@ async def keepwarm_set(request):
                 mode = (data.get("mode") or "").strip()
         except Exception:
             pass
+
     mode = _set_keepwarm_mode(mode)
     return _ok({"mode": mode})
 
 # Extra alias without dash to make CI typos harmless (URL: /keepwarmset)
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarmset")
-async def keepwarmset(request):
+async def keepwarmset(request: Request):  # <-- typed
     return await keepwarm_set(request)
 
 @app.function(**cpu_fn_args)
@@ -285,20 +307,22 @@ async def keepwarmset(request):
 async def keepwarm_status():
     return _ok({"mode": _get_keepwarm_mode()})
 
+
 # GPU-backed inference endpoints
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
-async def stage(request):
+async def stage(request: Request):  # <-- typed
     return await _stage_impl(request)
 
 # Pretty label alias (use this as "/" on your custom domain)
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stagesellpro")
-async def stagesellpro(request):
+async def stagesellpro(request: Request):  # <-- typed
     return await _stage_impl(request)
 
+
 # Shared implementation
-async def _stage_impl(request):
+async def _stage_impl(request: Request):  # <-- typed
     # API key
     err = _check_api_key(request.headers)
     if err:
@@ -315,7 +339,11 @@ async def _stage_impl(request):
         b64 = body.get("image_base64")
         if not (isinstance(b64, str) and b64.strip()):
             return _err("Missing 'image_base64' in JSON", code="missing_image", status=400)
-        payload = body.get("payload") if isinstance(body.get("payload"), dict) else _parse_payload_dict(body.get("payload", "{}"))
+        payload = (
+            body.get("payload")
+            if isinstance(body.get("payload"), dict)
+            else _parse_payload_dict(body.get("payload", "{}"))
+        )
         try:
             img_bytes = base64.b64decode(b64.split(",")[-1], validate=False)
         except Exception:
