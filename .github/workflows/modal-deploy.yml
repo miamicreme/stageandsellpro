@@ -175,6 +175,31 @@ PY
           echo "::error::Modal deploy failed after 3 attempts."
           exit 1
 
+      - name: Wait for app health (best-effort)
+        if: success()
+        shell: bash
+        env:
+          SSP_ACCOUNT: ${{ secrets.SSP_ACCOUNT }}
+          SSP_APP_PREFIX: ${{ secrets.SSP_APP_PREFIX }}
+        run: |
+          set -euo pipefail
+          ACC="${SSP_ACCOUNT:-${SSP_APP_PREFIX:-}}"
+          if [ -z "${ACC}" ]; then
+            echo "::warning::SSP_ACCOUNT/SSP_APP_PREFIX not provided; skipping health wait."
+            exit 0
+          fi
+          URL="https://${ACC}--health.modal.run"
+          echo "Waiting for health at ${URL}"
+          for i in {1..30}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL") || code=000
+            if [ "$code" -eq 200 ]; then
+              echo "Health OK"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::warning::Health did not return 200 within timeout; continuing anyway."
+
       # ================== Post-deploy: configure keep-warm mode ==================
       - name: Configure keep-warm mode
         if: success()
@@ -227,26 +252,40 @@ PY
 
           URL_DASH="https://${ACC}--keepwarm-set.modal.run"
           URL_ALIAS="https://${ACC}--keepwarmset.modal.run"
+          BODY_JSON=$(printf '{"mode":"%s"}' "$MODE")
 
-          echo "Setting keep-warm mode='${MODE}' at ${URL_DASH}"
-          BODY=$(printf '{"mode":"%s"}' "$MODE")
-
-          # Prepare headers
+          # Build headers (x-api-key optional)
           H_API=()
           if [ -n "${SSP_API_KEY:-}" ]; then
             H_API=(-H "x-api-key: ${SSP_API_KEY}")
           fi
 
-          code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${URL_DASH}" \
-                  -H "Content-Type: application/json" "${H_API[@]}" \
-                  -d "$BODY")
-          if [ "$code" -ge 400 ]; then
-            echo "Dashed endpoint returned HTTP $code. Trying alias ${URL_ALIAS} ..."
-            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${URL_ALIAS}" \
+          set_keepwarm() {
+            local base="$1" ; local mode="$2"
+            echo "Trying JSON POST at ${base}"
+            local code
+            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}" \
                     -H "Content-Type: application/json" "${H_API[@]}" \
-                    -d "$BODY")
-            if [ "$code" -ge 400 ]; then
-              echo "::error::keep-warm set failed with HTTP $code"
+                    -d "${BODY_JSON}") || code=000
+            if [ "$code" -lt 400 ]; then return 0; fi
+
+            echo "JSON returned $code. Trying form POST at ${base}"
+            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}" \
+                    -H "Content-Type: application/x-www-form-urlencoded" "${H_API[@]}" \
+                    --data-urlencode "mode=${mode}") || code=000
+            if [ "$code" -lt 400 ]; then return 0; fi
+
+            echo "Form returned $code. Trying query POST at ${base}?mode=${mode}"
+            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}?mode=${mode}" \
+                    "${H_API[@]}") || code=000
+            [ "$code" -lt 400 ]
+          }
+
+          echo "Setting keep-warm mode='${MODE}' at ${URL_DASH}"
+          if ! set_keepwarm "${URL_DASH}" "${MODE}"; then
+            echo "Dashed endpoint failed. Trying alias ${URL_ALIAS} ..."
+            if ! set_keepwarm "${URL_ALIAS}" "${MODE}"; then
+              echo "::error::keep-warm set failed"
               cat /tmp/keepwarm_set.json || true
               exit 1
             fi
