@@ -1,4 +1,5 @@
 name: Modal Deploy
+
 on:
   workflow_dispatch:
   push:
@@ -73,19 +74,9 @@ jobs:
             --token-secret "$CI_MODAL_TOKEN_SECRET" \
             --profile "$MODAL_PROFILE"
 
-          # Verify ~/.modal.toml has [prod] with token_id + token_secret
-          python - << 'PY'
-import sys, pathlib, tomllib
-p = pathlib.Path.home()/".modal.toml"
-d = tomllib.loads(p.read_text()) if p.exists() else {}
-pr = d.get("prod") or {}
-ok = bool(pr.get("token_id") and pr.get("token_secret"))
-sys.exit(0 if ok else 2)
-PY
-          if [ $? -ne 0 ]; then
-            echo "::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)"
-            exit 1
-          fi
+          # Verify ~/.modal.toml has [prod] with token_id + token_secret (no heredoc)
+          python -c "import sys, pathlib, tomllib; p=pathlib.Path.home()/'.modal.toml'; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get('prod') or {}; sys.exit(0 if (pr.get('token_id') and pr.get('token_secret')) else 2)" \
+          || { echo '::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)'; exit 1; }
 
           echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
           unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
@@ -132,12 +123,12 @@ PY
           # Back-compat (if you previously stored this): must also be just "miamicreme"
           SSP_APP_PREFIX: ${{ secrets.SSP_APP_PREFIX }}
 
-          # Optional API key (not required by keepwarm-set in code, but harmless if present)
+          # Optional API key (only used if your endpoint enforces x-api-key)
           SSP_API_KEY: ${{ secrets.STAGESELLPRO_KEY }}
 
           # Optional overrides; if empty we auto-pick by branch (main/master=business, others=off)
           KEEPWARM_MODE: ""               # off | dev | business
-          KEEPWARM_TZ: "America/New_York" # (reserved for future; ignored by server today)
+          KEEPWARM_TZ: "America/New_York" # (reserved for future)
           KEEPWARM_HOURS: "09:00-18:00"   # (reserved)
           KEEPWARM_WEEKDAYS: "1-5"        # (reserved)
         run: |
