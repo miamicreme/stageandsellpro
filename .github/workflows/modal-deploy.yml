@@ -32,19 +32,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Guard against underscore Modal URLs
+    - name: Guard against underscore Modal URLs
         shell: bash
         run: |
           set -euo pipefail
-          # Find the bad underscore URL usage anywhere EXCEPT workflow files
-          matches=$(git grep -n -E 'keepwarm_set\.modal\.run' -- ':!**/.github/workflows/*' || true)
+          # Look everywhere EXCEPT .git and .github (to avoid matching this workflow)
+          matches=$(grep -RIn --exclude-dir=.git --exclude-dir=.github -E 'keepwarm_set\.modal\.run' . || true)
           if [ -n "$matches" ]; then
-            echo "::error::Found invalid underscore URL(s). Replace with 'keepwarm-set.modal.run' or alias 'keepwarmset.modal.run':"
+            echo "::error::Found invalid underscore hostname(s). Use 'keepwarm-set.modal.run' or alias 'keepwarmset.modal.run':"
             echo "$matches"
             exit 1
           fi
-          # Optional: also guard route paths like /keepwarm_set (exclude workflows)
-          matches_routes=$(git grep -n -E '/keepwarm_set(\b|/|\?)' -- ':!**/.github/workflows/*' || true)
+
+          # Guard route paths too (still excluding .git/.github)
+          matches_routes=$(grep -RIn --exclude-dir=.git --exclude-dir=.github -E '(^|[^A-Za-z0-9_])/keepwarm_set(\b|/|\?)' . || true)
           if [ -n "$matches_routes" ]; then
             echo "::error::Found invalid underscore route path(s). Replace with '/keepwarm-set':"
             echo "$matches_routes"
