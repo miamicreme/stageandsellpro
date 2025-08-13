@@ -82,12 +82,17 @@ image = (
     .env({"HF_HOME": HF_CACHE_MOUNT})
 )
 
-# Shared function args
-common_fn_args = dict(
+# Shared function args (split to avoid reserving GPU for admin endpoints)
+gpu_fn_args = dict(
     image=image,
     timeout=900,
     gpu=GPU_TYPE,                                   # ✔ new Modal API — pass string
     network_file_systems={HF_CACHE_MOUNT: HF_CACHE} # ✔ correct NFS mapping
+)
+cpu_fn_args = dict(
+    image=image,
+    timeout=900,
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE}
 )
 
 # ── Globals (lazy singletons inside container) ───────────────────────────────
@@ -151,7 +156,7 @@ def _resize_long_edge(img, max_edge=2048):
 
 def _b64_jpeg(img, quality=92) -> str:
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    img.save(buf, format="JPEG", quality=92, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 def _sb_client():
@@ -226,7 +231,8 @@ def _lazy_load():
     return PIPE, DETECTOR
 
 # ── HTTP Endpoints ───────────────────────────────────────────────────────────
-@app.function(**common_fn_args)
+# CPU-only admin endpoints (no GPU reserved)
+@app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="GET", label="health")
 async def health():
     return _ok({
@@ -238,18 +244,60 @@ async def health():
         "supabase": bool(SUPABASE_URL and SUPABASE_KEY),
     })
 
-# Keep the old route working
-@app.function(**common_fn_args)
+@app.function(**cpu_fn_args)
+@modal.fastapi_endpoint(method="GET", label="warm")
+async def warm():
+    try:
+        _lazy_load()
+    except Exception as e:
+        return _err(f"Model load failed: {e}", code="model_load_failed", status=503)
+    return _ok({"warmed": True, "mode": _get_keepwarm_mode()})
+
+@app.function(**cpu_fn_args)
+@modal.fastapi_endpoint(method="POST", label="keepwarm-set")
+async def keepwarm_set(request):
+    mode = (request.query_params.get("mode") or "").strip()
+    if not mode:
+        try:
+            form = await request.form()
+            mode = (form.get("mode") or "").strip()
+        except Exception:
+            mode = ""
+    if not mode:
+        try:
+            body = await request.body()
+            if body:
+                data = json.loads(body.decode("utf-8"))
+                mode = (data.get("mode") or "").strip()
+        except Exception:
+            pass
+    mode = _set_keepwarm_mode(mode)
+    return _ok({"mode": mode})
+
+# Extra alias without dash to make CI typos harmless (URL: /keepwarmset)
+@app.function(**cpu_fn_args)
+@modal.fastapi_endpoint(method="POST", label="keepwarmset")
+async def keepwarmset(request):
+    return await keepwarm_set(request)
+
+@app.function(**cpu_fn_args)
+@modal.fastapi_endpoint(method="GET", label="keepwarm-status")
+async def keepwarm_status():
+    return _ok({"mode": _get_keepwarm_mode()})
+
+# GPU-backed inference endpoints
+@app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
 async def stage(request):
     return await _stage_impl(request)
 
-# Pretty label alias (no `--` in custom domain, this is what you'll map `/` to)
-@app.function(**common_fn_args)
+# Pretty label alias (use this as "/" on your custom domain)
+@app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stagesellpro")
 async def stagesellpro(request):
     return await _stage_impl(request)
 
+# Shared implementation
 async def _stage_impl(request):
     # API key
     err = _check_api_key(request.headers)
@@ -366,60 +414,14 @@ async def _stage_impl(request):
         },
     })
 
-@app.function(**common_fn_args)
-@modal.fastapi_endpoint(method="GET", label="warm")
-async def warm():
-    try:
-        _lazy_load()
-    except Exception as e:
-        return _err(f"Model load failed: {e}", code="model_load_failed", status=503)
-    return _ok({"warmed": True, "mode": _get_keepwarm_mode()})
-
-# NOTE: labels must be lowercase letters, numerals, and dashes.
-@app.function(**common_fn_args)
-@modal.fastapi_endpoint(method="POST", label="keepwarm-set")
-async def keepwarm_set(request):
-    mode = (request.query_params.get("mode") or "").strip()
-    if not mode:
-        try:
-            form = await request.form()
-            mode = (form.get("mode") or "").strip()
-        except Exception:
-            mode = ""
-    if not mode:
-        try:
-            body = await request.body()
-            if body:
-                data = json.loads(body.decode("utf-8"))
-                mode = (data.get("mode") or "").strip()
-        except Exception:
-            pass
-    mode = _set_keepwarm_mode(mode)
-    return _ok({"mode": mode})
-
-# Extra alias without dash to make CI typos harmless (URL: /keepwarmset)
-@app.function(**common_fn_args)
-@modal.fastapi_endpoint(method="POST", label="keepwarmset")
-async def keepwarmset(request):
-    return await keepwarm_set(request)
-
-@app.function(**common_fn_args)
-@modal.fastapi_endpoint(method="GET", label="keepwarm-status")
-async def keepwarm_status():
-    return _ok({"mode": _get_keepwarm_mode()})
-
-# Scheduled keep-warm — slower & safe by default
-@app.function(
-    schedule=modal.Period(seconds=KEEPWARM_PERIOD_SEC),
-    image=image,
-    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
-)
+# Scheduled keep-warm — slower & safe by default (CPU)
+@app.function(schedule=modal.Period(seconds=KEEPWARM_PERIOD_SEC), **cpu_fn_args)
 def keepwarm_cron():
     mode = _get_keepwarm_mode()
     # No-op unless explicitly enabled to conserve credits
     if mode == "off":
         return {"ok": True, "skipped": True, "mode": mode}
-    # Light-touch ping: do NOT load models on CPU cron unless business mode
+    # Light-touch ping in dev
     if mode == "dev":
         return {"ok": True, "ping": True, "mode": mode}
     # business: touch the pipeline to keep weights warm on the next GPU invoke
