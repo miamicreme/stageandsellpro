@@ -1,5 +1,5 @@
 # modal/modal_app.py
-# Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal (production hardened)
+# Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal (production hardened, credit-friendly)
 
 from __future__ import annotations
 
@@ -13,9 +13,6 @@ import pathlib
 from typing import Optional, Tuple
 
 import modal
-
-# ── Optional runtime imports (local, fast) ────────────────────────────────────
-# We import Torch/Diffusers/PIL lazily where needed to keep import time low.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
@@ -46,15 +43,18 @@ DEFAULT_SEED = int(os.getenv("SEED", "0"))
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", "").strip()
 
 # Keep-warm mode persisted on NFS (survives container restarts)
+# NOTE: Default to OFF to conserve credits. Flip via /keepwarm-set.
 KEEPWARM_DIR = os.path.join(HF_CACHE_MOUNT, "ssp")
 KEEPWARM_FILE = os.path.join(KEEPWARM_DIR, "keepwarm_mode.txt")
-DEFAULT_MODE = "business"  # business | dev | off
+DEFAULT_MODE = (os.getenv("KEEPWARM_DEFAULT_MODE") or "off").lower()  # off | dev | business
+
+# Reduce scheduler frequency to save credits (env override allowed)
+KEEPWARM_PERIOD_SEC = int(os.getenv("KEEPWARM_PERIOD_SEC", "1800"))  # default: 30 min
 
 # Optional Supabase upload
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", "")).strip()
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "ssp-outputs").strip()
-
 
 # ── Modal setup ───────────────────────────────────────────────────────────────
 app = modal.App(APP_NAME)
@@ -82,12 +82,12 @@ image = (
     .env({"HF_HOME": HF_CACHE_MOUNT})
 )
 
-# ── Shared function args ─────────────────────────────────────────────────────
+# Shared function args
 common_fn_args = dict(
     image=image,
     timeout=900,
-    gpu=GPU_TYPE,                                  # ✔ new Modal API — pass string
-    network_file_systems={HF_CACHE_MOUNT: HF_CACHE}  # ✔ correct NFS mapping
+    gpu=GPU_TYPE,                                   # ✔ new Modal API — pass string
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE} # ✔ correct NFS mapping
 )
 
 # ── Globals (lazy singletons inside container) ───────────────────────────────
@@ -95,10 +95,8 @@ PIPE = None
 DETECTOR = None
 _SB = None  # Supabase client
 
-
 # ── Utilities ─────────────────────────────────────────────────────────────────
 def _json(data: dict, status: int = 200):
-    """Return JSON with optional CORS headers."""
     from starlette.responses import JSONResponse
     headers = {}
     if CORS_ORIGIN:
@@ -109,15 +107,12 @@ def _json(data: dict, status: int = 200):
         })
     return JSONResponse(content=data, status_code=status, headers=headers)
 
-
 def _ok(payload: dict, status: int = 200):
     payload = {"ok": True, **payload}
     return _json(payload, status=status)
 
-
 def _err(msg: str, code: str = "bad_request", status: int = 400):
     return _json({"ok": False, "error": msg, "error_code": code}, status=status)
-
 
 def _check_api_key(hdrs) -> Optional[str]:
     if not API_KEY:
@@ -126,10 +121,8 @@ def _check_api_key(hdrs) -> Optional[str]:
         return "Unauthorized: bad or missing x-api-key"
     return None
 
-
 def _ensure_keepwarm_dir():
     pathlib.Path(KEEPWARM_DIR).mkdir(parents=True, exist_ok=True)
-
 
 def _get_keepwarm_mode() -> str:
     try:
@@ -138,7 +131,6 @@ def _get_keepwarm_mode() -> str:
             return m if m in ("off", "dev", "business") else DEFAULT_MODE
     except FileNotFoundError:
         return DEFAULT_MODE
-
 
 def _set_keepwarm_mode(mode: str) -> str:
     mode = (mode or "").lower()
@@ -149,7 +141,6 @@ def _set_keepwarm_mode(mode: str) -> str:
         f.write(mode)
     return mode
 
-
 def _resize_long_edge(img, max_edge=2048):
     from PIL import Image
     w, h = img.size
@@ -158,15 +149,12 @@ def _resize_long_edge(img, max_edge=2048):
     scale = max_edge / max(w, h)
     return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-
 def _b64_jpeg(img, quality=92) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
-
 def _sb_client():
-    """Lazy init Supabase client, if env provided."""
     global _SB
     if _SB is not None:
         return _SB
@@ -176,22 +164,17 @@ def _sb_client():
     _SB = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _SB
 
-
 def _maybe_upload_jpeg(jpeg_bytes: bytes) -> Optional[str]:
-    """Upload to Supabase storage if configured; return public URL."""
     sb = _sb_client()
     if not sb:
         return None
-    # path like: sdxl/2025-08-12/uuid.jpg
     day = time.strftime("%Y-%m-%d")
     key = f"sdxl/{day}/{uuid.uuid4().hex}.jpg"
     try:
         sb.storage.from_(SUPABASE_BUCKET).upload(key, jpeg_bytes, {"content-type": "image/jpeg", "upsert": "true"})
-        pub = sb.storage.from_(SUPABASE_BUCKET).get_public_url(key)
-        return pub
+        return sb.storage.from_(SUPABASE_BUCKET).get_public_url(key)
     except Exception:
         return None
-
 
 def _parse_payload_dict(raw: str) -> dict:
     try:
@@ -199,28 +182,16 @@ def _parse_payload_dict(raw: str) -> dict:
     except Exception:
         return {"_raw": raw}
 
-
 def _norm_params(p: dict) -> Tuple[str, str, int, float, Optional[int], float, str, str]:
-    """Clamp and normalize user params."""
     style = str(p.get("style", "modern"))
     room = str(p.get("room", "living room"))
-
-    steps = int(p.get("steps", DEFAULT_STEPS))
-    steps = max(5, min(75, steps))
-
-    guidance = float(p.get("guidance", DEFAULT_GUIDANCE))
-    guidance = max(1.0, min(13.0, guidance))
-
+    steps = max(5, min(75, int(p.get("steps", DEFAULT_STEPS))))
+    guidance = max(1.0, min(13.0, float(p.get("guidance", DEFAULT_GUIDANCE))))
     seed = int(p.get("seed", DEFAULT_SEED)) or None
-
-    strength = float(p.get("strength", 0.85))
-    strength = max(0.0, min(1.0, strength))
-
+    strength = max(0.0, min(1.0, float(p.get("strength", 0.85))))
     negative = p.get("negative_prompt", "blurry, low quality, artifacts, watermark, deformed")
     prompt = p.get("prompt") or f"{style} {room}, tasteful furniture, natural light, photo-realistic, 4k, professional interior photograph"
-
     return style, room, steps, guidance, seed, strength, negative, prompt
-
 
 # ── Model loader ─────────────────────────────────────────────────────────────
 def _lazy_load():
@@ -254,7 +225,6 @@ def _lazy_load():
     DETECTOR = LineartDetector.from_pretrained("lllyasviel/Annotators")
     return PIPE, DETECTOR
 
-
 # ── HTTP Endpoints ───────────────────────────────────────────────────────────
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="GET", label="health")
@@ -268,10 +238,19 @@ async def health():
         "supabase": bool(SUPABASE_URL and SUPABASE_KEY),
     })
 
-
+# Keep the old route working
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
 async def stage(request):
+    return await _stage_impl(request)
+
+# Pretty label alias (no `--` in custom domain, this is what you'll map `/` to)
+@app.function(**common_fn_args)
+@modal.fastapi_endpoint(method="POST", label="stagesellpro")
+async def stagesellpro(request):
+    return await _stage_impl(request)
+
+async def _stage_impl(request):
     # API key
     err = _check_api_key(request.headers)
     if err:
@@ -279,32 +258,27 @@ async def stage(request):
 
     ct = (request.headers.get("content-type") or "").lower()
 
-    # 1) JSON mode (image_base64 + payload)
+    # 1) JSON mode
     if "application/json" in ct:
         try:
             body = await request.json()
         except Exception:
-            raw = (await request.body() or b"").decode("utf-8", "ignore")
             return _err("Invalid JSON body", code="invalid_json", status=400)
-
         b64 = body.get("image_base64")
         if not (isinstance(b64, str) and b64.strip()):
             return _err("Missing 'image_base64' in JSON", code="missing_image", status=400)
-
         payload = body.get("payload") if isinstance(body.get("payload"), dict) else _parse_payload_dict(body.get("payload", "{}"))
-        img_bytes: bytes
         try:
             img_bytes = base64.b64decode(b64.split(",")[-1], validate=False)
         except Exception:
             return _err("image_base64 is not valid base64", code="invalid_base64", status=400)
 
-    # 2) Multipart mode (file field 'image' + payload string/json)
+    # 2) Multipart mode
     else:
         try:
             form = await request.form()
         except Exception:
             return _err("Expected multipart/form-data or application/json", code="unsupported_media_type", status=415)
-
         file = form.get("image")
         if file is None:
             return _err("Missing file field 'image' (multipart/form-data)", code="missing_image", status=400)
@@ -336,7 +310,7 @@ async def stage(request):
     # Preprocess
     t1 = time.time()
     try:
-        guide = detector(base)  # grayscale guidance map
+        guide = detector(base)
     except Exception as e:
         return _err(f"Preprocess failed: {e}", code="preprocess_failed", status=500)
 
@@ -378,7 +352,7 @@ async def stage(request):
     return _ok({
         "output_base64": b64_out,
         "output_url": out_url,
-        "images": [b64_out],  # compatibility with clients that expect an array
+        "images": [b64_out],
         "timings": {
             "load_models_s": round(load_s, 3),
             "preprocess_s": round(prep_s, 3),
@@ -392,8 +366,6 @@ async def stage(request):
         },
     })
 
-
-# Force warm-up
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="GET", label="warm")
 async def warm():
@@ -403,12 +375,10 @@ async def warm():
         return _err(f"Model load failed: {e}", code="model_load_failed", status=503)
     return _ok({"warmed": True, "mode": _get_keepwarm_mode()})
 
-
 # NOTE: labels must be lowercase letters, numerals, and dashes.
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarm-set")
 async def keepwarm_set(request):
-    # Accept mode via query, form, or JSON
     mode = (request.query_params.get("mode") or "").strip()
     if not mode:
         try:
@@ -427,19 +397,35 @@ async def keepwarm_set(request):
     mode = _set_keepwarm_mode(mode)
     return _ok({"mode": mode})
 
+# Extra alias without dash to make CI typos harmless (URL: /keepwarmset)
+@app.function(**common_fn_args)
+@modal.fastapi_endpoint(method="POST", label="keepwarmset")
+async def keepwarmset(request):
+    return await keepwarm_set(request)
 
 @app.function(**common_fn_args)
 @modal.fastapi_endpoint(method="GET", label="keepwarm-status")
 async def keepwarm_status():
     return _ok({"mode": _get_keepwarm_mode()})
 
-
-# Scheduled keep-warm (no web label)
-@app.function(schedule=modal.Period(seconds=300), image=image, network_file_systems={HF_CACHE_MOUNT: HF_CACHE})
+# Scheduled keep-warm — slower & safe by default
+@app.function(
+    schedule=modal.Period(seconds=KEEPWARM_PERIOD_SEC),
+    image=image,
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE},
+)
 def keepwarm_cron():
     mode = _get_keepwarm_mode()
+    # No-op unless explicitly enabled to conserve credits
     if mode == "off":
         return {"ok": True, "skipped": True, "mode": mode}
-    # Touch the pipeline (lightweight)
-    _lazy_load()
-    return {"ok": True, "mode": mode}
+    # Light-touch ping: do NOT load models on CPU cron unless business mode
+    if mode == "dev":
+        return {"ok": True, "ping": True, "mode": mode}
+    # business: touch the pipeline to keep weights warm on the next GPU invoke
+    try:
+        _lazy_load()
+        return {"ok": True, "mode": mode, "warmed": True}
+    except Exception as e:
+        # Prevent error spam in dashboard
+        return {"ok": False, "mode": mode, "error": f"{e.__class__.__name__}: {e}"}
