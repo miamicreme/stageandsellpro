@@ -32,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-    - name: Guard against underscore Modal URLs
+      - name: Guard against underscore Modal URLs
         shell: bash
         run: |
           set -euo pipefail
