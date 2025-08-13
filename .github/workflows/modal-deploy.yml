@@ -62,8 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-import sys, glob, pathlib, re, subprocess
-# Ensure PyYAML is available
+import sys, pathlib, re, subprocess
 try:
     import yaml  # type: ignore
 except Exception:
@@ -207,7 +206,7 @@ PY
         env:
           # Preferred: your Modal account subdomain (e.g., "miamicreme")
           SSP_ACCOUNT: ${{ secrets.SSP_ACCOUNT }}
-          # Back-compat (if you previously stored this): must also be just "miamicreme"
+          # Back-compat: same value if you previously stored it
           SSP_APP_PREFIX: ${{ secrets.SSP_APP_PREFIX }}
 
           # Optional API key (only used if your endpoint enforces x-api-key)
