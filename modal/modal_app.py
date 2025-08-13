@@ -414,6 +414,7 @@ async def _stage_impl(request):
         },
     })
 
+
 # Scheduled keep-warm — slower & safe by default (CPU)
 @app.function(schedule=modal.Period(seconds=KEEPWARM_PERIOD_SEC), **cpu_fn_args)
 def keepwarm_cron():
