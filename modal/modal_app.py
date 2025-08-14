@@ -1,6 +1,6 @@
 # modal/modal_app.py
 # Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal
-# (production hardened, credit-friendly; FastAPI imports deferred for deploy)
+# (production hardened, credit-friendly; FastAPI imports deferred for deploy-safe typing)
 
 import base64
 import io
@@ -9,13 +9,19 @@ import os
 import time
 import uuid
 import pathlib
-from typing import Optional, Tuple, Any, TYPE_CHECKING
+from typing import Optional, Tuple, Any
 
 import modal
 
-if TYPE_CHECKING:
-    # Editor-only import to keep type hints without runtime dependency
-    from fastapi import Request as FastAPIRequest
+# IMPORTANT:
+# - During GitHub Actions "modal deploy", fastapi/starlette may NOT be installed on the host.
+# - We conditionally import for typing so deploy doesn't fail, but at runtime inside the container
+#   (where FastAPI/Starlette are installed), the real type is used and FastAPI won't treat
+#   `request` as a required query parameter (avoids 422).
+try:
+    from fastapi import Request as FastAPIRequest  # runtime (inside Modal container)
+except Exception:  # pragma: no cover
+    FastAPIRequest = Any  # deploy-time fallback on host without fastapi
 
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
@@ -212,7 +218,7 @@ def _norm_params(p: dict) -> Tuple[str, str, int, float, Optional[int], float, s
 
 # ── Model loader ─────────────────────────────────────────────────────────────
 def _lazy_load():
-    """Load SDXL Inpaint + ControlNet + detector once per container."""
+    \"\"\"Load SDXL Inpaint + ControlNet + detector once per container.\"\"\"
     global PIPE, DETECTOR
     if PIPE is not None and DETECTOR is not None:
         return PIPE, DETECTOR
@@ -271,7 +277,7 @@ async def warm():
 # NOTE: labels must be lowercase letters, numerals, and dashes.
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarm-set")
-async def keepwarm_set(request: Any):
+async def keepwarm_set(request: FastAPIRequest):
     mode = (request.query_params.get("mode") or "").strip()
 
     if not mode:
@@ -296,7 +302,7 @@ async def keepwarm_set(request: Any):
 # Extra alias without dash to make CI typos harmless (URL: /keepwarmset)
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarmset")
-async def keepwarmset(request: Any):
+async def keepwarmset(request: FastAPIRequest):
     return await keepwarm_set(request)
 
 @app.function(**cpu_fn_args)
@@ -307,17 +313,17 @@ async def keepwarm_status():
 # GPU-backed inference endpoints
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
-async def stage(request: Any):
+async def stage(request: FastAPIRequest):
     return await _stage_impl(request)
 
 # Pretty label alias (use this as "/" on your custom domain)
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stagesellpro")
-async def stagesellpro(request: Any):
+async def stagesellpro(request: FastAPIRequest):
     return await _stage_impl(request)
 
 # Shared implementation
-async def _stage_impl(request: Any):
+async def _stage_impl(request: FastAPIRequest):
     # API key
     err = _check_api_key(request.headers)
     if err:
