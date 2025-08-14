@@ -76,13 +76,27 @@ jobs:
             echo "::error::Missing MODAL_TOKEN_ID or MODAL_TOKEN_SECRET in repo secrets."
             exit 1
           fi
-          python -m modal token set \
-            --token-id "$CI_MODAL_TOKEN_ID" \
-            --token-secret "$CI_MODAL_TOKEN_SECRET" \
-            --profile "$MODAL_PROFILE"
+          python -m modal token set                 --token-id "$CI_MODAL_TOKEN_ID"                 --token-secret "$CI_MODAL_TOKEN_SECRET"                 --profile "$MODAL_PROFILE"
           # Verify ~/.modal.toml has [prod] with token_id + token_secret
-          python -c "import sys, pathlib, tomllib; p=pathlib.Path.home()/'.modal.toml'; d=tomllib.loads(p.read_text()) if p.exists() else {}; pr=d.get('prod') or {}; sys.exit(0 if (pr.get('token_id') and pr.get('token_secret')) else 2)" \
-          || { echo '::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)'; exit 1; }
+          python - <<'PY'
+import sys, pathlib
+try:
+    import tomllib  # py3.11+
+except Exception:
+    print("::error::tomllib missing")
+    sys.exit(2)
+p = pathlib.Path.home()/'.modal.toml'
+if not p.exists():
+    print("::error::.modal.toml not found after token set")
+    sys.exit(2)
+d = tomllib.loads(p.read_text())
+pr = d.get('prod') or {}
+sys.exit(0 if (pr.get('token_id') and pr.get('token_secret')) else 2)
+PY
+          if [ "$?" -ne 0 ]; then
+            echo '::error::Modal token verification failed (missing [prod].token_id/token_secret in ~/.modal.toml)'
+            exit 1
+          fi
           echo "MODAL_PROFILE=$MODAL_PROFILE" >> "$GITHUB_ENV"
           unset CI_MODAL_TOKEN_ID CI_MODAL_TOKEN_SECRET
 
@@ -105,8 +119,7 @@ jobs:
           echo "Using MODAL_PROFILE=${MODAL_PROFILE}"
           echo "Deploying entrypoint: ${MODAL_ENTRYPOINT}"
           for attempt in 1 2 3; do
-            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET \
-              python -m modal deploy "${MODAL_ENTRYPOINT}"; then
+            if env -u MODAL_TOKEN_ID -u MODAL_TOKEN_SECRET                   python -m modal deploy "${MODAL_ENTRYPOINT}"; then
               echo "Deploy succeeded."
               exit 0
             fi
@@ -141,7 +154,6 @@ jobs:
           done
           echo "::warning::Health did not return 200 within timeout; continuing anyway."
 
-      # ================== Post-deploy: configure keep-warm mode ==================
       - name: Configure keep-warm mode
         if: success()
         shell: bash
@@ -180,18 +192,13 @@ jobs:
             local base="$1" ; local mode="$2"
             echo "Trying JSON POST at ${base}"
             local code
-            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}" \
-                    -H "Content-Type: application/json" "${H_API[@]}" \
-                    -d "${BODY_JSON}") || code=000
+            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}"                         -H "Content-Type: application/json" "${H_API[@]}"                         -d "${BODY_JSON}") || code=000
             if [ "$code" -lt 400 ]; then return 0; fi
             echo "JSON returned $code. Trying form POST at ${base}"
-            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}" \
-                    -H "Content-Type: application/x-www-form-urlencoded" "${H_API[@]}" \
-                    --data-urlencode "mode=${mode}") || code=000
+            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}"                         -H "Content-Type: application/x-www-form-urlencoded" "${H_API[@]}"                         --data-urlencode "mode=${mode}") || code=000
             if [ "$code" -lt 400 ]; then return 0; fi
             echo "Form returned $code. Trying query POST at ${base}?mode=${mode}"
-            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}?mode=${mode}" \
-                    "${H_API[@]}") || code=000
+            code=$(curl -s -o /tmp/keepwarm_set.json -w "%{http_code}" -X POST "${base}?mode=${mode}"                         "${H_API[@]}") || code=000
             [ "$code" -lt 400 ]
           }
 
