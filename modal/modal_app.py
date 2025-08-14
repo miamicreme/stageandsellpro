@@ -1,6 +1,6 @@
 # modal/modal_app.py
 # Stage & Sell Pro — SDXL + ControlNet virtual staging on Modal
-# (production hardened, credit-friendly)
+# (production hardened, credit-friendly; FastAPI imports deferred for deploy)
 
 import base64
 import io
@@ -9,10 +9,13 @@ import os
 import time
 import uuid
 import pathlib
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, TYPE_CHECKING
 
 import modal
-from fastapi import Request  # explicit import for request typing
+
+if TYPE_CHECKING:
+    # Editor-only import to keep type hints without runtime dependency
+    from fastapi import Request as FastAPIRequest
 
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_NAME = "stage-sell-pro-pipeline"
@@ -92,8 +95,8 @@ image = (
 gpu_fn_args = dict(
     image=image,
     timeout=900,
-    gpu=GPU_TYPE,                                   # ✔ pass string per new API
-    network_file_systems={HF_CACHE_MOUNT: HF_CACHE} # ✔ correct NFS mapping
+    gpu=GPU_TYPE,                                   # pass string per new API
+    network_file_systems={HF_CACHE_MOUNT: HF_CACHE} # correct NFS mapping
 )
 cpu_fn_args = dict(
     image=image,
@@ -268,7 +271,7 @@ async def warm():
 # NOTE: labels must be lowercase letters, numerals, and dashes.
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarm-set")
-async def keepwarm_set(request: Request):
+async def keepwarm_set(request: Any):
     mode = (request.query_params.get("mode") or "").strip()
 
     if not mode:
@@ -293,7 +296,7 @@ async def keepwarm_set(request: Request):
 # Extra alias without dash to make CI typos harmless (URL: /keepwarmset)
 @app.function(**cpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="keepwarmset")
-async def keepwarmset(request: Request):
+async def keepwarmset(request: Any):
     return await keepwarm_set(request)
 
 @app.function(**cpu_fn_args)
@@ -304,17 +307,17 @@ async def keepwarm_status():
 # GPU-backed inference endpoints
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stage")
-async def stage(request: Request):
+async def stage(request: Any):
     return await _stage_impl(request)
 
 # Pretty label alias (use this as "/" on your custom domain)
 @app.function(**gpu_fn_args)
 @modal.fastapi_endpoint(method="POST", label="stagesellpro")
-async def stagesellpro(request: Request):
+async def stagesellpro(request: Any):
     return await _stage_impl(request)
 
 # Shared implementation
-async def _stage_impl(request: Request):
+async def _stage_impl(request: Any):
     # API key
     err = _check_api_key(request.headers)
     if err:
